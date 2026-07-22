@@ -1,0 +1,51 @@
+[workspace]
+members = ["crates/kappa-distribution"]
+
+[package]
+name = "kappa-conformance"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "κ-Distribution protocol conformance test binary — 149 tests across 5 levels, the sole authority for registry conformance."
+
+[[bin]]
+name = "kappa-conformance"
+path = "src/main.rs"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forbidden dependencies (impl spec §1):
+#   uor-addr          — circular validation
+#   Any registry crate — code sharing breaks test independence
+#   tokio              — binary is synchronous
+#   Any OCI crate      — not an OCI tool
+#   Any database crate — not a store
+# ─────────────────────────────────────────────────────────────────────────────
+
+[dependencies]
+# Independent SHA-256 (verify-on-receipt for the harness itself)
+sha2 = "0.10"
+
+# Independent BLAKE3 for multi-axis tests
+blake3 = "1"
+
+# Synchronous HTTP client
+reqwest = { version = "0.12", features = ["blocking"] }
+
+# Response deserialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP Basic auth encoding
+base64 = "0.22"
+
+# Report timestamps
+chrono = "0.4"
+
+# Federation test blob uniqueness
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = true
+strip = true
