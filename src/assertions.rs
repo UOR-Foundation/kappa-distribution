@@ -2,22 +2,6 @@
 
 use crate::kappa::KappaLabel;
 
-pub fn assert_status(actual: u16, expected: u16) -> Result<(), String> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!("expected status {expected}, got {actual}"))
-    }
-}
-
-pub fn assert_status_in(actual: u16, expected: &[u16]) -> Result<(), String> {
-    if expected.contains(&actual) {
-        Ok(())
-    } else {
-        Err(format!("expected status in {expected:?}, got {actual}"))
-    }
-}
-
 pub fn assert_header_present(headers: &[(String, String)], name: &str) -> Result<(), String> {
     let lower = name.to_lowercase();
     if headers.iter().any(|(k, _)| k.to_lowercase() == lower) {

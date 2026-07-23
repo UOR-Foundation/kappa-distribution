@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct Config {
     pub registry_url: String,
     pub namespace: String,
@@ -16,12 +17,14 @@ pub struct Config {
     pub report_dir: PathBuf,
 }
 
+#[derive(Clone)]
 pub enum Auth {
     None,
     Bearer(String),
     Basic { username: String, password: String },
 }
 
+#[derive(Clone)]
 pub enum TeardownOrder {
     TagsFirst,
     BlobsFirst,

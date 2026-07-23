@@ -12,27 +12,6 @@ use crate::kappa::KappaLabel;
 use crate::runner::TestRunner;
 use crate::testdata::TestData;
 
-/// Helper: extract headers as lowercase key-value pairs from a response.
-fn hdrs(resp: &reqwest::blocking::Response) -> Vec<(String, String)> {
-    resp.headers()
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_lowercase(),
-                v.to_str().unwrap_or("").to_string(),
-            )
-        })
-        .collect()
-}
-
-/// Helper: get a header value by lowercase name.
-fn hdr_val<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.as_str())
-}
-
 pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, data: &TestData) {
     let ns = &config.namespace;
 
@@ -42,22 +21,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L1-01", 1, "Version check");
         match client.send_traced(client.get("/v2/")) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let status = resp.status().as_u16();
-                if let Err(e) = assert_status(status, 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if r.body_text().contains("kappa-distribution") {
+                    t.pass();
                 } else {
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains("kappa-distribution") {
-                                t.pass();
-                            } else {
-                                t.fail("body missing kappa-distribution key".into());
-                            }
-                        }
-                        Err(e) => t.fail(format!("failed to read body: {e}")),
-                    }
+                    t.fail("body missing kappa-distribution key".into());
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -67,18 +38,17 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     // ── §5.2 Push/Pull/Verify ────────────────────────────────────────────────
 
     // L1-02 MUST "Push HELLO monolithic"
-    // inject() sets Content-Type: application/octet-stream on all PUTs.
     {
         let mut t = runner.must("L1-02", 1, "Push blob monolithic");
         let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
         let rb = client.put(&path).body(data.hello.content.to_vec());
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -91,56 +61,88 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
         let rb = client.put(&path).body(data.hello.content.to_vec());
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[200, 201]) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 || r.status == 201 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 
-    // L1-04 MUST "Wrong κ-label rejected"
+    // L1-04 MUST "Wrong kappa-label rejected"
     {
-        let mut t = runner.must("L1-04", 1, "Push blob wrong κ-label rejected");
+        let mut t = runner.must("L1-04", 1, "Push blob wrong kappa-label rejected");
         let path = format!("/v2/{ns}/blobs/{}", data.empty.sha256.as_str());
         let rb = client.put(&path).body(data.hello.content.to_vec());
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 409) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 409 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(409));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 
-    // L1-05 MUST "HEAD headers" - verify presence AND value of X-Kappa-Label and X-Kappa-Axis
+    // L1-05 MUST "HEAD headers"
     {
         let mut t = runner.must("L1-05", 1, "HEAD blob headers present and correct");
         let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
         match client.send_traced(client.head(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if let Err(e) = assert_header_present(&r.headers, "content-length") {
                     t.fail(e);
+                } else if let Err(e) =
+                    assert_header_value(&r.headers, "x-kappa-label", data.hello.sha256.as_str())
+                {
+                    t.fail(format!("X-Kappa-Label value wrong: {e}"));
+                } else if let Err(e) = assert_header_value(&r.headers, "x-kappa-axis", "sha256") {
+                    t.fail(format!("X-Kappa-Axis value wrong: {e}"));
                 } else {
-                    let h = hdrs(&resp);
-                    if let Err(e) = assert_header_present(&h, "content-length") {
+                    t.pass();
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L1-06 MUST "GET content"
+    let mut l1_06_body: Option<Vec<u8>> = None;
+    let mut l1_06_server_kappa: Option<String> = None;
+    let mut l1_06_trace: Option<crate::client::HttpTrace> = None;
+    {
+        let mut t = runner.must("L1-06", 1, "GET blob content correct");
+        let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
+        match client.send_traced(client.get(&path)) {
+            Ok(r) => {
+                l1_06_trace = Some(r.trace.clone());
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let server_label = r.header("x-kappa-label").unwrap_or("").to_string();
+                    if server_label.is_empty() {
+                        t.fail("X-Kappa-Label header missing on GET response".into());
+                    } else if server_label != data.hello.sha256.as_str() {
+                        t.fail(format!(
+                            "X-Kappa-Label wrong: server={server_label}, expected={}",
+                            data.hello.sha256.as_str()
+                        ));
+                    } else if let Err(e) = assert_body_eq(&r.body, data.hello.content) {
                         t.fail(e);
-                    } else if let Err(e) =
-                        assert_header_value(&h, "x-kappa-label", data.hello.sha256.as_str())
-                    {
-                        t.fail(format!("X-Kappa-Label value wrong: {e}"));
-                    } else if let Err(e) = assert_header_value(&h, "x-kappa-axis", "sha256") {
-                        t.fail(format!("X-Kappa-Axis value wrong: {e}"));
                     } else {
+                        l1_06_server_kappa = Some(server_label);
+                        l1_06_body = Some(r.body.clone());
                         t.pass();
                     }
                 }
@@ -149,58 +151,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L1-06 MUST "GET content" - verify body AND X-Kappa-Label header
-    let mut l1_06_body: Option<Vec<u8>> = None;
-    let mut l1_06_server_kappa: Option<String> = None;
-    let mut l1_06_traces: Vec<crate::client::HttpTrace> = Vec::new();
-    {
-        let mut t = runner.must("L1-06", 1, "GET blob content correct");
-        let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
-        match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                l1_06_traces.push(trace.clone());
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
-                } else {
-                    // Verify X-Kappa-Label present and correct.
-                    let h = hdrs(&resp);
-                    let server_label = hdr_val(&h, "x-kappa-label").unwrap_or("").to_string();
-                    if server_label.is_empty() {
-                        t.fail("X-Kappa-Label header missing on GET response".into());
-                    } else if server_label != data.hello.sha256.as_str() {
-                        t.fail(format!(
-                            "X-Kappa-Label wrong: server={server_label}, expected={}",
-                            data.hello.sha256.as_str()
-                        ));
-                    } else {
-                        l1_06_server_kappa = Some(server_label);
-                        match resp.bytes() {
-                            Ok(body) => {
-                                if let Err(e) = assert_body_eq(&body, data.hello.content) {
-                                    t.fail(e);
-                                } else {
-                                    l1_06_body = Some(body.to_vec());
-                                    t.pass();
-                                }
-                            }
-                            Err(e) => t.fail(format!("body read failed: {e}")),
-                        }
-                    }
-                }
-            }
-            Err(e) => t.fail(format!("request failed: {e}")),
-        }
-    }
-
-    // L1-07 MUST "Verify κ independently" - full chain: re_hash(body) == X-Kappa-Label == expected
+    // L1-07 MUST "Verify kappa independently"
     {
         let mut t = runner.must(
             "L1-07",
             1,
             "Content matches known bytes (full verify-on-receipt chain)",
         );
-        for tr in &l1_06_traces {
+        if let Some(tr) = &l1_06_trace {
             t.trace(tr.clone());
         }
         match (&l1_06_body, &l1_06_server_kappa) {
@@ -221,7 +179,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                     t.pass();
                 }
             }
-            _ => t.fail("L1-06 did not produce body and/or server κ-label".into()),
+            _ => t.fail("L1-06 did not produce body and/or server kappa-label".into()),
         }
     }
 
@@ -231,12 +189,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let absent = format!("sha256:{}", "0".repeat(64));
         let path = format!("/v2/{ns}/blobs/{absent}");
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 404) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 404 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(404));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -249,12 +207,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let absent = format!("sha256:{}", "0".repeat(64));
         let path = format!("/v2/{ns}/blobs/{absent}");
         match client.send_traced(client.head(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 404) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 404 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(404));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -269,12 +227,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let path = format!("/v2/{ns}/blobs/{}", data.empty.sha256.as_str());
         let rb = client.put(&path).body(Vec::<u8>::new());
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -286,21 +244,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L1-11", 1, "GET empty blob");
         let path = format!("/v2/{ns}/blobs/{}", data.empty.sha256.as_str());
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if !r.body.is_empty() {
+                    t.fail(format!("expected 0 bytes, got {}", r.body.len()));
                 } else {
-                    match resp.bytes() {
-                        Ok(body) => {
-                            if !body.is_empty() {
-                                t.fail(format!("expected 0 bytes, got {}", body.len()));
-                            } else {
-                                t.pass();
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
-                    }
+                    t.pass();
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -313,12 +264,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let path = format!("/v2/{ns}/blobs/{}", data.unknown_fields.sha256.as_str());
         let rb = client.put(&path).body(data.unknown_fields.content.to_vec());
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -330,21 +281,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L1-13", 1, "GET blob preserves unknown fields");
         let path = format!("/v2/{ns}/blobs/{}", data.unknown_fields.sha256.as_str());
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if let Err(e) = assert_body_eq(&r.body, data.unknown_fields.content) {
                     t.fail(e);
                 } else {
-                    match resp.bytes() {
-                        Ok(body) => {
-                            if let Err(e) = assert_body_eq(&body, data.unknown_fields.content) {
-                                t.fail(e);
-                            } else {
-                                t.pass();
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
-                    }
+                    t.pass();
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -359,10 +303,9 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             let path = format!("/v2/{ns}/blobs/{}", blob.sha256.as_str());
             let rb = client.put(&path).body(blob.content.to_vec());
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    let s = resp.status().as_u16();
-                    if s != 201 && s != 200 {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 201 && r.status != 200 {
                         failed_blob = Some(blob.name);
                         break;
                     }
@@ -379,17 +322,17 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L1-15 SHOULD "List by prefix" (endpoint not in §6.17 summary table)
+    // L1-15 SHOULD "List by prefix" (endpoint not in section 6.17 summary table)
     {
         let mut t = runner.should("L1-15", 1, "List blobs by prefix");
         let path = format!("/v2/{ns}/blobs/?prefix=sha256:");
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if resp.status().as_u16() == 200 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
                     t.pass();
                 } else {
-                    t.fail(format!("list endpoint returned {}", resp.status()));
+                    t.fail(r.fail_msg(200));
                 }
             }
             Err(e) => t.fail(format!("list endpoint unreachable: {e}")),
@@ -405,33 +348,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let ct_kappa = KappaLabel::sha256(ct_blob);
         let path = format!("/v2/{ns}/blobs/{}", ct_kappa.as_str());
         let rb = client
-            .put(&path)
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&path, "application/json")
             .body(ct_blob.to_vec());
         match client.send_traced(rb) {
-            Ok((_put_resp, put_trace)) => {
-                t.trace(put_trace);
-                // Verify GET echoes Content-Type
+            Ok(put_r) => {
+                t.trace(put_r.trace.clone());
                 match client.send_traced(client.get(&path)) {
-                    Ok((get_resp, get_trace)) => {
-                        t.trace(get_trace);
-                        let get_ct = get_resp
-                            .headers()
-                            .get("content-type")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
+                    Ok(get_r) => {
+                        t.trace(get_r.trace.clone());
+                        let get_ct = get_r.header("content-type").unwrap_or("");
                         if !get_ct.contains("application/json") {
                             t.fail(format!("Content-Type not echoed on GET: got \"{get_ct}\""));
                         } else {
-                            // Verify HEAD also echoes Content-Type.
                             match client.send_traced(client.head(&path)) {
-                                Ok((head_resp, head_trace)) => {
-                                    t.trace(head_trace);
-                                    let head_ct = head_resp
-                                        .headers()
-                                        .get("content-type")
-                                        .and_then(|v| v.to_str().ok())
-                                        .unwrap_or("");
+                                Ok(head_r) => {
+                                    t.trace(head_r.trace.clone());
+                                    let head_ct = head_r.header("content-type").unwrap_or("");
                                     if head_ct.contains("application/json") {
                                         t.pass();
                                     } else {
@@ -455,21 +387,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L1-17", 1, "Content-Type default octet-stream");
         let path = format!("/v2/{ns}/blobs/{}", data.no_content_type.sha256.as_str());
-        // Use put_no_content_type to ensure no Content-Type header is sent
         let rb = client
             .put_no_content_type(&path)
             .body(data.no_content_type.content.to_vec());
         match client.send_traced(rb) {
-            Ok((_put_resp, put_trace)) => {
-                t.trace(put_trace);
+            Ok(put_r) => {
+                t.trace(put_r.trace.clone());
                 match client.send_traced(client.get(&path)) {
-                    Ok((get_resp, get_trace)) => {
-                        t.trace(get_trace);
-                        let ct = get_resp
-                            .headers()
-                            .get("content-type")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
+                    Ok(get_r) => {
+                        t.trace(get_r.trace.clone());
+                        let ct = get_r.header("content-type").unwrap_or("");
                         if ct.contains("octet-stream") || ct.is_empty() {
                             t.pass();
                         } else {
@@ -489,20 +416,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     let mut upload_url = String::new();
     let chunk_size = config.upload_chunk_size;
+    let mut l1_20_headers: Vec<(String, String)> = Vec::new();
 
     // L1-20 MUST "Upload POST"
     {
         let mut t = runner.must("L1-20", 1, "Chunked upload start");
         let path = format!("/v2/{ns}/blobs/uploads/");
         match client.send_traced(client.post(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 202) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 202 {
+                    t.fail(r.fail_msg(202));
                 } else {
-                    match resp.headers().get("location") {
+                    l1_20_headers = r.headers.clone();
+                    match r.header("location") {
                         Some(loc) => {
-                            upload_url = loc.to_str().unwrap_or("").to_string();
+                            upload_url = loc.to_string();
                             t.pass();
                         }
                         None => t.fail("missing Location header".into()),
@@ -520,9 +449,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // L1-22 SHOULD "Chunk-Min-Length"
     {
-        runner
-            .should("L1-22", 1, "Chunk-Min-Length observed")
-            .warn("X-Kappa-Chunk-Min-Length not checked (response not captured)".into());
+        let t = runner.should("L1-22", 1, "Chunk-Min-Length observed");
+        if let Err(e) = assert_header_present(&l1_20_headers, "x-kappa-chunk-min-length") {
+            t.fail(e);
+        } else {
+            t.pass();
+        }
     }
 
     let chunks: Vec<&[u8]> = data.large_content.chunks(chunk_size).collect();
@@ -539,15 +471,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 .header("Content-Range", format!("0-{end}"))
                 .body(chunks[0].to_vec());
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 202) {
-                        t.fail(e);
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 202 {
+                        t.fail(r.fail_msg(202));
                     } else {
-                        if let Some(loc) = resp.headers().get("location") {
-                            if let Ok(l) = loc.to_str() {
-                                upload_url = l.to_string();
-                            }
+                        if let Some(loc) = r.header("location") {
+                            upload_url = loc.to_string();
                         }
                         t.pass();
                     }
@@ -570,15 +500,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 .header("Content-Range", format!("{start}-{end}"))
                 .body(chunks[1].to_vec());
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 202) {
-                        t.fail(e);
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 202 {
+                        t.fail(r.fail_msg(202));
                     } else {
-                        if let Some(loc) = resp.headers().get("location") {
-                            if let Ok(l) = loc.to_str() {
-                                upload_url = l.to_string();
-                            }
+                        if let Some(loc) = r.header("location") {
+                            upload_url = loc.to_string();
                         }
                         t.pass();
                     }
@@ -600,12 +528,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 .header("Content-Range", format!("0-{end}"))
                 .body(chunks[0].to_vec());
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 416) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 416 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(416));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -620,24 +548,19 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             t.fail("no upload URL".into());
         } else {
             match client.send_traced(client.get_url(&upload_url)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 204) {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 204 {
+                        t.fail(r.fail_msg(204));
+                    } else if let Err(e) = assert_header_present(&r.headers, "range") {
+                        t.fail(e);
+                    } else if let Err(e) = assert_header_present(&r.headers, "location") {
                         t.fail(e);
                     } else {
-                        let h = hdrs(&resp);
-                        if let Err(e) = assert_header_present(&h, "range") {
-                            t.fail(e);
-                        } else if let Err(e) = assert_header_present(&h, "location") {
-                            t.fail(e);
-                        } else {
-                            if let Some(loc) = resp.headers().get("location") {
-                                if let Ok(l) = loc.to_str() {
-                                    upload_url = l.to_string();
-                                }
-                            }
-                            t.pass();
+                        if let Some(loc) = r.header("location") {
+                            upload_url = loc.to_string();
                         }
+                        t.pass();
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -658,12 +581,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 .header("Content-Range", format!("{far}-{far_end}"))
                 .body(chunks.last().unwrap().to_vec());
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 416) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 416 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(416));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -678,15 +601,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             t.fail("no upload URL".into());
         } else {
             match client.send_traced(client.get_url(&upload_url)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 204) {
-                        t.fail(e);
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 204 {
+                        t.fail(r.fail_msg(204));
                     } else {
-                        if let Some(loc) = resp.headers().get("location") {
-                            if let Ok(l) = loc.to_str() {
-                                upload_url = l.to_string();
-                            }
+                        if let Some(loc) = r.header("location") {
+                            upload_url = loc.to_string();
                         }
                         t.pass();
                     }
@@ -711,16 +632,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                     .header("Content-Range", format!("{offset}-{end}"))
                     .body(chunk.to_vec());
                 match client.send_traced(rb) {
-                    Ok((resp, trace)) => {
-                        t.trace(trace);
-                        if resp.status().as_u16() != 202 {
+                    Ok(r) => {
+                        t.trace(r.trace.clone());
+                        if r.status != 202 {
                             ok = false;
                             break;
                         }
-                        if let Some(loc) = resp.headers().get("location") {
-                            if let Ok(l) = loc.to_str() {
-                                upload_url = l.to_string();
-                            }
+                        if let Some(loc) = r.header("location") {
+                            upload_url = loc.to_string();
                         }
                     }
                     Err(_) => {
@@ -740,7 +659,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // L1-30 MUST "Upload complete"
     {
-        let mut t = runner.must("L1-30", 1, "Upload complete with κ-label");
+        let mut t = runner.must("L1-30", 1, "Upload complete with kappa-label");
         if upload_url.is_empty() {
             t.fail("no upload URL".into());
         } else {
@@ -751,19 +670,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             };
             let rb = client.put_url(&complete_url).body(Vec::<u8>::new());
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 201) {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 201 {
+                        t.fail(r.fail_msg(201));
+                    } else if let Err(e) =
+                        assert_header_value(&r.headers, "x-kappa-label", data.large_sha256.as_str())
+                    {
                         t.fail(e);
                     } else {
-                        let h = hdrs(&resp);
-                        if let Err(e) =
-                            assert_header_value(&h, "x-kappa-label", data.large_sha256.as_str())
-                        {
-                            t.fail(e);
-                        } else {
-                            t.pass();
-                        }
+                        t.pass();
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -776,40 +692,28 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L1-31", 1, "Completed blob retrievable");
         let path = format!("/v2/{ns}/blobs/{}", data.large_sha256.as_str());
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if let Err(e) = assert_kappa_matches(&r.body, &data.large_sha256) {
                     t.fail(e);
                 } else {
-                    match resp.bytes() {
-                        Ok(body) => {
-                            if let Err(e) = assert_kappa_matches(&body, &data.large_sha256) {
-                                t.fail(e);
-                            } else {
-                                t.pass();
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
-                    }
+                    t.pass();
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 
-    // L1-32 MUST "Wrong κ on close"
+    // L1-32 MUST "Wrong kappa on close"
     {
-        let mut t = runner.must("L1-32", 1, "Wrong κ-label on complete rejected");
+        let mut t = runner.must("L1-32", 1, "Wrong kappa-label on complete rejected");
         let start_path = format!("/v2/{ns}/blobs/uploads/");
         match client.send_traced(client.post(&start_path)) {
-            Ok((resp, trace)) if resp.status().as_u16() == 202 => {
-                t.trace(trace);
-                let loc = resp
-                    .headers()
-                    .get("location")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
+            Ok(r) if r.status == 202 => {
+                t.trace(r.trace.clone());
+                let loc = r.header("location").unwrap_or("").to_string();
                 if loc.is_empty() {
                     t.fail("no Location from upload POST".into());
                 } else {
@@ -818,8 +722,8 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                         .patch_url(&loc)
                         .header("Content-Range", format!("0-{}", chunk.len() - 1))
                         .body(chunk.to_vec());
-                    if let Ok((_patch_resp, patch_trace)) = client.send_traced(patch_rb) {
-                        t.trace(patch_trace);
+                    if let Ok(pr) = client.send_traced(patch_rb) {
+                        t.trace(pr.trace.clone());
                     }
                     let wrong_kappa = data.hello.sha256.as_str();
                     let close_url = if loc.contains('?') {
@@ -829,21 +733,21 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                     };
                     let rb = client.put_url(&close_url).body(Vec::<u8>::new());
                     match client.send_traced(rb) {
-                        Ok((resp2, trace2)) => {
-                            t.trace(trace2);
-                            if let Err(e) = assert_status(resp2.status().as_u16(), 409) {
-                                t.fail(e);
-                            } else {
+                        Ok(r2) => {
+                            t.trace(r2.trace.clone());
+                            if r2.status == 409 {
                                 t.pass();
+                            } else {
+                                t.fail(r2.fail_msg(409));
                             }
                         }
                         Err(e) => t.fail(format!("close request failed: {e}")),
                     }
                 }
             }
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                t.fail(format!("upload POST returned {}", resp.status()));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                t.fail(r.fail_msg(202));
             }
             Err(e) => t.fail(format!("request failed: {e}")),
         }
@@ -855,28 +759,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L1-33", 1, "Upload cancellation");
         let start_path = format!("/v2/{ns}/blobs/uploads/");
         match client.send_traced(client.post(&start_path)) {
-            Ok((resp, trace)) if resp.status().as_u16() == 202 => {
-                t.trace(trace);
-                cancel_url = resp
-                    .headers()
-                    .get("location")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                // PATCH the known partial content so L1-35 can verify it wasn't stored.
-                // Verify the PATCH succeeds before cancelling.
+            Ok(r) if r.status == 202 => {
+                t.trace(r.trace.clone());
+                cancel_url = r.header("location").unwrap_or("").to_string();
                 let partial = data.cancel_partial_content;
                 let patch_rb = client
                     .patch_url(&cancel_url)
                     .header("Content-Range", format!("0-{}", partial.len() - 1))
                     .body(partial.to_vec());
                 match client.send_traced(patch_rb) {
-                    Ok((patch_resp, patch_trace)) => {
-                        t.trace(patch_trace);
-                        if patch_resp.status().as_u16() != 202 {
+                    Ok(pr) => {
+                        t.trace(pr.trace.clone());
+                        if pr.status != 202 {
                             t.fail(format!(
-                                "cancel test PATCH returned {}, cannot verify cancellation semantics",
-                                patch_resp.status()
+                                "cancel test PATCH returned {}, cannot verify cancellation semantics: {}",
+                                pr.status,
+                                pr.body_text()
                             ));
                             return;
                         }
@@ -886,22 +784,21 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                         return;
                     }
                 }
-                // Now cancel
                 match client.send_traced(client.delete_url(&cancel_url)) {
-                    Ok((resp2, trace2)) => {
-                        t.trace(trace2);
-                        if let Err(e) = assert_status(resp2.status().as_u16(), 204) {
-                            t.fail(e);
-                        } else {
+                    Ok(r2) => {
+                        t.trace(r2.trace.clone());
+                        if r2.status == 204 {
                             t.pass();
+                        } else {
+                            t.fail(r2.fail_msg(204));
                         }
                     }
                     Err(e) => t.fail(format!("delete failed: {e}")),
                 }
             }
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                t.fail(format!("upload POST returned {}", resp.status()));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                t.fail(r.fail_msg(202));
             }
             Err(e) => t.fail(format!("request failed: {e}")),
         }
@@ -914,13 +811,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             t.fail("no cancel URL from L1-33".into());
         } else {
             match client.send_traced(client.get_url(&cancel_url)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    let s = resp.status().as_u16();
-                    if s == 404 || s == 400 {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 404 || r.status == 400 {
                         t.pass();
                     } else {
-                        t.fail(format!("expected 404 or 400, got {s}"));
+                        t.fail(format!(
+                            "expected 404 or 400, got {}: {}",
+                            r.status,
+                            r.body_text()
+                        ));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -933,14 +833,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L1-35", 1, "Cancelled partial data not stored");
         let path = format!("/v2/{ns}/blobs/{}", data.cancel_partial_sha256.as_str());
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if resp.status().as_u16() == 404 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 404 {
                     t.pass();
                 } else {
                     t.fail(format!(
-                        "cancelled partial data found in store (status {}), expected 404",
-                        resp.status()
+                        "cancelled partial data found in store (status {}), expected 404: {}",
+                        r.status,
+                        r.body_text()
                     ));
                 }
             }
@@ -960,16 +861,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.hello.sha256.as_str()
         );
         match client.send_traced(client.post(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 201 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 {
                     mount_succeeded = true;
                     t.pass();
-                } else if s == 202 {
+                } else if r.status == 202 {
                     t.warn("mount returned 202 (fallback to upload)".into());
                 } else {
-                    t.fail(format!("expected 201 or 202, got {s}"));
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -989,21 +889,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             let mut t = runner.should("L1-41", 1, "Mounted blob retrievable");
             let path = format!("/v2/{ns}-mount/blobs/{}", data.hello.sha256.as_str());
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 200 {
+                        t.fail(r.fail_msg(200));
+                    } else if let Err(e) = assert_kappa_matches(&r.body, &data.hello.sha256) {
                         t.fail(e);
                     } else {
-                        match resp.bytes() {
-                            Ok(body) => {
-                                if let Err(e) = assert_kappa_matches(&body, &data.hello.sha256) {
-                                    t.fail(e);
-                                } else {
-                                    t.pass();
-                                }
-                            }
-                            Err(e) => t.fail(format!("body read failed: {e}")),
-                        }
+                        t.pass();
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -1018,19 +911,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let absent = format!("sha256:{}", "f".repeat(64));
         let path = format!("/v2/{ns}-mount/blobs/uploads/?mount={absent}");
         match client.send_traced(client.post(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 202) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 202 {
+                    t.fail(r.fail_msg(202));
                 } else {
-                    fallback_loc = resp
-                        .headers()
-                        .get("location")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    let h = hdrs(&resp);
-                    if let Err(e) = assert_header_present(&h, "location") {
+                    fallback_loc = r.header("location").unwrap_or("").to_string();
+                    if let Err(e) = assert_header_present(&r.headers, "location") {
                         t.fail(e);
                     } else {
                         t.pass();
@@ -1069,16 +956,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.hello.sha256.as_str()
         );
         match client.send_traced(client.post(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 201 || s == 202 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 202 {
                     t.pass();
                 } else {
-                    t.warn(format!("mount without from returned {s}"));
+                    t.fail(r.fail_msg(201));
                 }
             }
-            Err(e) => t.warn(format!("mount without from failed: {e}")),
+            Err(e) => t.fail(format!("mount without from failed: {e}")),
         }
     }
 
@@ -1096,17 +982,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         );
         let rb = client.put(&path).body(data.hello.content.to_vec());
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 201 || s == 200 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
                     multi_label_supported = true;
                     t.pass();
                 } else {
-                    t.warn(format!("multi-label push returned {s}"));
+                    t.warn(format!("multi-label push returned {}", r.status));
                 }
             }
-            Err(e) => t.warn(format!("request failed: {e}")),
+            Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 
@@ -1120,16 +1005,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 client.send_traced(client.get(&sha_path)),
                 client.send_traced(client.get(&blake_path)),
             ) {
-                (Ok((r1, t1)), Ok((r2, t2))) => {
-                    t.trace(t1);
-                    t.trace(t2);
-                    if r1.status().as_u16() == 200 && r2.status().as_u16() == 200 {
+                (Ok(r1), Ok(r2)) => {
+                    t.trace(r1.trace.clone());
+                    t.trace(r2.trace.clone());
+                    if r1.status == 200 && r2.status == 200 {
                         t.pass();
                     } else {
                         t.fail(format!(
                             "sha256 GET {}, blake3 GET {}",
-                            r1.status(),
-                            r2.status()
+                            r1.status, r2.status
                         ));
                     }
                 }
@@ -1147,43 +1031,34 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // L1-52 SHOULD "Multi-label fallback"
     {
-        if !multi_label_supported {
-            let mut t = runner.should("L1-52", 1, "Multi-label fallback");
-            let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
-            match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if resp.status().as_u16() == 200 {
-                        t.pass();
-                    } else {
-                        t.fail(format!("primary κ not retrievable: {}", resp.status()));
-                    }
+        let mut t = runner.should("L1-52", 1, "Multi-label fallback");
+        let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
+        match client.send_traced(client.get(&path)) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
                 }
-                Err(e) => t.fail(format!("request failed: {e}")),
             }
-        } else {
-            runner.skip(
-                "L1-52",
-                1,
-                "Multi-label fallback",
-                "multi-label was supported",
-            );
+            Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 
-    // L1-53 MUST "Multi-label bad κ rejected"
+    // L1-53 MUST "Multi-label bad kappa rejected"
     {
-        let mut t = runner.must("L1-53", 1, "Multi-label invalid κ-label rejected");
+        let mut t = runner.must("L1-53", 1, "Multi-label invalid kappa-label rejected");
         let bad = format!("sha256:{}", "0".repeat(64));
         let path = format!("/v2/{ns}/blobs/{}?also={bad}", data.hello.sha256.as_str());
         let rb = client.put(&path).body(data.hello.content.to_vec());
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 409) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 409 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(409));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -1218,13 +1093,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.may("L1-90", 1, "Blob deletion");
         let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
         match client.send_traced(client.delete(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 202 || s == 405 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 202 || r.status == 405 {
                     t.pass();
                 } else {
-                    t.warn(format!("blob delete returned {s}"));
+                    t.warn(format!("blob delete returned {}", r.status));
                 }
             }
             Err(e) => t.warn(format!("request failed: {e}")),
@@ -1236,7 +1110,6 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         runner.skip("L1-91", 1, "Teardown cleanup", "teardown disabled");
     } else {
         let t = runner.may("L1-91", 1, "Teardown cleanup");
-        // Level 1 has no tags; both teardown orders reduce to blob deletion.
         let blobs = [
             &data.empty.sha256,
             &data.config.sha256,
@@ -1250,7 +1123,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             TeardownOrder::TagsFirst | TeardownOrder::BlobsFirst => {
                 for kappa in blobs {
                     let path = format!("/v2/{ns}/blobs/{}", kappa.as_str());
-                    let _ = client.delete(&path).send();
+                    let _ = client.send_traced(client.delete(&path));
                 }
             }
         }

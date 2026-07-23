@@ -38,21 +38,18 @@ fn main() {
         Ok(_) => {}
     }
 
-    // Run requested levels.
-    if config.levels.contains(&1) {
-        tests::level1::run(&mut runner, &client, &config, &data);
-    }
-    if config.levels.contains(&2) {
-        tests::level2::run(&mut runner, &client, &config, &data);
-    }
-    if config.levels.contains(&3) {
-        tests::level3::run(&mut runner, &client, &config, &data);
-    }
-    if config.levels.contains(&4) {
-        tests::level4::run(&mut runner, &client, &config, &data);
-    }
-    if config.levels.contains(&5) {
-        tests::level5::run(&mut runner, &client, &config, &data);
+    // Run requested levels. Each level uses its own namespace (B34).
+    for level in &config.levels {
+        let mut level_config = config.clone();
+        level_config.namespace = format!("{}/l{level}", config.namespace);
+        match level {
+            1 => tests::level1::run(&mut runner, &client, &level_config, &data),
+            2 => tests::level2::run(&mut runner, &client, &level_config, &data),
+            3 => tests::level3::run(&mut runner, &client, &level_config, &data),
+            4 => tests::level4::run(&mut runner, &client, &level_config, &data),
+            5 => tests::level5::run(&mut runner, &client, &level_config, &data),
+            _ => {}
+        }
     }
 
     // Reports.

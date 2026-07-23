@@ -8,7 +8,7 @@
 //! regardless of how reqwest handles per-request headers internally.
 
 use crate::config::{Auth, Config};
-use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{HeaderMap, HeaderValue, LOCATION};
 use reqwest::redirect::Policy;
 use std::time::Instant;
@@ -29,6 +29,47 @@ pub struct HttpTrace {
     pub resp_headers: Vec<(String, String)>,
     pub resp_body_size: usize,
     pub duration_ms: u64,
+}
+
+/// A fully consumed HTTP response with trace metadata. The body is read eagerly
+/// so status, headers, and body are all available without consuming the response
+/// object. Every FAIL verdict includes the body for diagnostics (B35).
+#[derive(Clone, Debug)]
+pub struct TracedResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub trace: HttpTrace,
+}
+
+impl TracedResponse {
+    /// The body as a UTF-8 string, lossy.
+    pub fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
+
+    /// Get a header value by case-insensitive name.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let lower = name.to_lowercase();
+        self.headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == lower)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Format a failure message with status and body context.
+    pub fn fail_msg(&self, expected_status: u16) -> String {
+        let body_preview = self.body_text();
+        let preview = if body_preview.len() > 4096 {
+            &body_preview[..4096]
+        } else {
+            &body_preview
+        };
+        format!(
+            "expected status {expected_status}, got {}: {preview}",
+            self.status
+        )
+    }
 }
 
 /// Extract `{scheme}://{authority}` from a URL string for host boundary comparison.
@@ -94,95 +135,131 @@ impl RegistryClient {
         }
     }
 
-    /// Inject standard headers: Accept, Content-Type (application/octet-stream default),
-    /// and Authorization. Every request through the client carries these unless explicitly
-    /// overridden by the caller (e.g., L1-16 overrides Content-Type to application/json).
-    fn inject(&self, rb: RequestBuilder) -> RequestBuilder {
-        let rb = rb
-            .header("Accept", "application/octet-stream, application/json")
-            .header("Content-Type", "application/octet-stream");
-        match &self.auth_header {
-            Some(h) => rb.header("Authorization", h.clone()),
-            None => rb,
+    /// Build a complete HeaderMap for requests without a body (GET, HEAD, DELETE).
+    fn headers_no_body(&self) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            "accept",
+            "application/octet-stream, application/json"
+                .parse()
+                .unwrap(),
+        );
+        if let Some(auth) = &self.auth_header {
+            h.insert("authorization", auth.clone());
         }
+        h
     }
 
-    /// Inject Accept and Authorization but NOT Content-Type. Used by L1-17 to push a blob
-    /// with no Content-Type header so the registry's default behavior can be tested.
-    fn inject_no_content_type(&self, rb: RequestBuilder) -> RequestBuilder {
-        let rb = rb.header("Accept", "application/octet-stream, application/json");
-        match &self.auth_header {
-            Some(h) => rb.header("Authorization", h.clone()),
-            None => rb,
-        }
+    /// Build a complete HeaderMap for requests with a body (PUT, POST, PATCH).
+    /// Content-Type defaults to application/octet-stream. Callers that need a
+    /// different Content-Type pass it as a parameter.
+    fn headers_with_body(&self, content_type: &str) -> reqwest::header::HeaderMap {
+        let mut h = self.headers_no_body();
+        h.insert("content-type", content_type.parse().unwrap());
+        h
     }
 
     pub fn get(&self, path: &str) -> RequestBuilder {
-        self.inject(self.inner.get(format!("{}{path}", self.base_url)))
+        self.inner
+            .get(format!("{}{path}", self.base_url))
+            .headers(self.headers_no_body())
     }
 
     pub fn head(&self, path: &str) -> RequestBuilder {
-        self.inject(self.inner.head(format!("{}{path}", self.base_url)))
+        self.inner
+            .head(format!("{}{path}", self.base_url))
+            .headers(self.headers_no_body())
     }
 
     pub fn put(&self, path: &str) -> RequestBuilder {
-        self.inject(self.inner.put(format!("{}{path}", self.base_url)))
+        self.inner
+            .put(format!("{}{path}", self.base_url))
+            .headers(self.headers_with_body("application/octet-stream"))
     }
 
     pub fn post(&self, path: &str) -> RequestBuilder {
-        self.inject(self.inner.post(format!("{}{path}", self.base_url)))
+        self.inner
+            .post(format!("{}{path}", self.base_url))
+            .headers(self.headers_with_body("application/octet-stream"))
     }
 
     pub fn delete(&self, path: &str) -> RequestBuilder {
-        self.inject(self.inner.delete(format!("{}{path}", self.base_url)))
+        self.inner
+            .delete(format!("{}{path}", self.base_url))
+            .headers(self.headers_no_body())
     }
 
     pub fn patch_url(&self, url: &str) -> RequestBuilder {
-        self.inject(self.inner.patch(resolve_location(&self.base_url, url)))
+        self.inner
+            .patch(resolve_location(&self.base_url, url))
+            .headers(self.headers_with_body("application/octet-stream"))
     }
 
     pub fn put_url(&self, url: &str) -> RequestBuilder {
-        self.inject(self.inner.put(resolve_location(&self.base_url, url)))
+        self.inner
+            .put(resolve_location(&self.base_url, url))
+            .headers(self.headers_with_body("application/octet-stream"))
     }
 
     pub fn get_url(&self, url: &str) -> RequestBuilder {
-        self.inject(self.inner.get(resolve_location(&self.base_url, url)))
+        self.inner
+            .get(resolve_location(&self.base_url, url))
+            .headers(self.headers_no_body())
     }
 
     pub fn delete_url(&self, url: &str) -> RequestBuilder {
-        self.inject(self.inner.delete(resolve_location(&self.base_url, url)))
+        self.inner
+            .delete(resolve_location(&self.base_url, url))
+            .headers(self.headers_no_body())
     }
 
-    /// PUT without Content-Type header. Used exclusively by L1-17 to test the registry's
-    /// default Content-Type response when no Content-Type was set on PUT (spec §6.1).
+    /// PUT with a specific Content-Type. Used when the test needs a non-default
+    /// Content-Type (e.g., L1-16 uses application/json). The HeaderMap is built
+    /// with the specified Content-Type, so callers do not append a second value.
+    pub fn put_with_content_type(&self, path: &str, content_type: &str) -> RequestBuilder {
+        self.inner
+            .put(format!("{}{path}", self.base_url))
+            .headers(self.headers_with_body(content_type))
+    }
+
+    /// POST with a specific Content-Type. Used when the request sends JSON
+    /// (e.g., gc/pin, gc/unpin, gc/sweep, filter registration).
+    pub fn post_with_content_type(&self, path: &str, content_type: &str) -> RequestBuilder {
+        self.inner
+            .post(format!("{}{path}", self.base_url))
+            .headers(self.headers_with_body(content_type))
+    }
+
+    /// PUT without Content-Type header. Used by L1-17 to test the registry's
+    /// default Content-Type response when no Content-Type was set on PUT.
     pub fn put_no_content_type(&self, path: &str) -> RequestBuilder {
-        self.inject_no_content_type(self.inner.put(format!("{}{path}", self.base_url)))
+        self.inner
+            .put(format!("{}{path}", self.base_url))
+            .headers(self.headers_no_body())
     }
 
     /// Direct tag binding: PUT /v2/{path}/tags/{name}?kappa={κ-label} with no body.
     /// Pointer-only - no content re-upload required.
     pub fn put_tag(&self, path: &str, name: &str, kappa: &str) -> RequestBuilder {
-        self.inject(
-            self.inner
-                .put(format!("{}{path}/tags/{name}?kappa={kappa}", self.base_url)),
-        )
+        self.inner
+            .put(format!("{}{path}/tags/{name}?kappa={kappa}", self.base_url))
+            .headers(self.headers_no_body())
     }
 
     /// Direct tag resolution: GET /v2/{path}/tags/{name} - returns κ-label only, no content body.
     pub fn get_tag(&self, path: &str, name: &str) -> RequestBuilder {
-        self.inject(
-            self.inner
-                .get(format!("{}{path}/tags/{name}", self.base_url)),
-        )
+        self.inner
+            .get(format!("{}{path}/tags/{name}", self.base_url))
+            .headers(self.headers_no_body())
     }
 
-    /// Send a request and capture an HTTP trace (with credential redaction).
+    /// Send a request, fully consume the response, and return a TracedResponse
+    /// with status, headers, body, and trace metadata all available as fields.
     ///
     /// If the response is a cross-host redirect (3xx with Location pointing to a different
     /// `{scheme}://{authority}`), the client re-issues the request to the redirect target
-    /// WITHOUT the Authorization header (spec §6.1). The trace captures both the original
-    /// and the redirected request.
-    pub fn send_traced(&self, rb: RequestBuilder) -> Result<(Response, HttpTrace), reqwest::Error> {
+    /// WITHOUT the Authorization header (spec §6.1).
+    pub fn send_traced(&self, rb: RequestBuilder) -> Result<TracedResponse, reqwest::Error> {
         let req = rb.build()?;
         let method_str = req.method().to_string();
         let method = req.method().clone();
@@ -194,9 +271,6 @@ impl RegistryClient {
         let resp = self.inner.execute(req)?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        // Detect cross-host redirect that was stopped by the policy.
-        // If the response is a 3xx with a Location header pointing to a different origin,
-        // re-issue without Authorization.
         let (final_resp, final_duration) = if resp.status().is_redirection() {
             if let Some(location) = resp.headers().get(LOCATION) {
                 let loc_str = location.to_str().unwrap_or("");
@@ -205,12 +279,10 @@ impl RegistryClient {
                 let target_origin = origin_of(&target);
 
                 if orig_origin != target_origin {
-                    // Cross-host: re-issue WITHOUT Authorization (spec §6.1).
                     let redirect_rb = self
                         .inner
                         .request(method, &target)
                         .header("Accept", "application/octet-stream, application/json");
-                    // Deliberately no Authorization header.
                     let redirect_req = redirect_rb.build()?;
                     let redirect_resp = self.inner.execute(redirect_req)?;
                     let redirect_duration = start.elapsed().as_millis() as u64;
@@ -227,7 +299,7 @@ impl RegistryClient {
 
         let status = final_resp.status().as_u16();
         let resp_headers = redact_headers(final_resp.headers());
-        let resp_body_size = final_resp.content_length().map(|n| n as usize).unwrap_or(0);
+        let body = final_resp.bytes().unwrap_or_default().to_vec();
 
         let trace = HttpTrace {
             method: method_str,
@@ -235,11 +307,17 @@ impl RegistryClient {
             req_headers,
             req_body_size,
             status,
-            resp_headers,
-            resp_body_size,
+            resp_headers: resp_headers.clone(),
+            resp_body_size: body.len(),
             duration_ms: final_duration,
         };
-        Ok((final_resp, trace))
+
+        Ok(TracedResponse {
+            status,
+            headers: resp_headers,
+            body,
+            trace,
+        })
     }
 }
 

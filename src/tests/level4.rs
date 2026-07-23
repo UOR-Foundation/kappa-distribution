@@ -5,39 +5,18 @@
 //! and validation, and F4/E7/E8 digest coincidence disambiguation.
 
 use crate::assertions::*;
-use crate::client::{HttpTrace, RegistryClient};
+use crate::client::{RegistryClient, TracedResponse};
 use crate::config::Config;
 use crate::kappa::KappaLabel;
 use crate::runner::TestRunner;
 use crate::testdata::TestData;
 
-/// Helper: extract headers as lowercase key-value pairs from a response.
-fn hdrs(resp: &reqwest::blocking::Response) -> Vec<(String, String)> {
-    resp.headers()
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_lowercase(),
-                v.to_str().unwrap_or("").to_string(),
-            )
-        })
-        .collect()
-}
-
-fn hdr_val<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.as_str())
-}
-
-/// Compose helper that returns trace for the caller to record.
 fn compose(
     client: &RegistryClient,
     ns: &str,
     op: &str,
     operands: &[&str],
-) -> Result<(u16, String, HttpTrace), String> {
+) -> Result<TracedResponse, String> {
     let list = operands
         .iter()
         .map(|o| format!("\"{o}\""))
@@ -45,17 +24,11 @@ fn compose(
         .join(",");
     let body = format!(r#"{{"operands":[{list}]}}"#);
     let rb = client
-        .post(&format!("/v2/{ns}/compose/{op}"))
-        .header("Content-Type", "application/json")
+        .post_with_content_type(&format!("/v2/{ns}/compose/{op}"), "application/json")
         .body(body);
-    match client.send_traced(rb) {
-        Ok((resp, trace)) => {
-            let status = resp.status().as_u16();
-            let body = resp.text().unwrap_or_default();
-            Ok((status, body, trace))
-        }
-        Err(e) => Err(format!("request failed: {e}")),
-    }
+    client
+        .send_traced(rb)
+        .map_err(|e| format!("request failed: {e}"))
 }
 
 fn json_get(body: &str, key: &str) -> Option<String> {
@@ -73,12 +46,11 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     for blob in [&data.hello, &data.config, &data.layer_a, &data.layer_b] {
         let path = format!("/v2/{ns}/blobs/{}", blob.sha256.as_str());
         let rb = client.put(&path).body(blob.content.to_vec());
-        if let Ok((resp, _)) = client.send_traced(rb) {
-            let s = resp.status().as_u16();
-            if s != 201 && s != 200 {
+        if let Ok(r) = client.send_traced(rb) {
+            if r.status != 201 && r.status != 200 {
                 eprintln!(
-                    "Level 4 setup: blob {} push returned {s}, aborting level",
-                    blob.name
+                    "Level 4 setup: blob {} push returned {}, aborting level",
+                    blob.name, r.status
                 );
                 return;
             }
@@ -91,7 +63,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // ── §8.1 G2 ──────────────────────────────────────────────────────────────
 
-    // L4-01 MUST "G2 compose" - capture response for L4-02
+    // L4-01 MUST "G2 compose"
     {
         let mut t = runner.must("L4-01", 4, "G2 composition");
         match compose(
@@ -100,22 +72,23 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             "g2",
             &[data.hello.sha256.as_str(), data.config.sha256.as_str()],
         ) {
-            Ok((200, body, trace)) => {
-                t.trace(trace);
-                composed_kappa = json_get(&body, "composed").unwrap_or_default();
-                witness_kappa = json_get(&body, "witness").unwrap_or_default();
-                l4_01_body = body;
-                t.pass();
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 200, got {s}"));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    let body = r.body_text();
+                    composed_kappa = json_get(&body, "composed").unwrap_or_default();
+                    witness_kappa = json_get(&body, "witness").unwrap_or_default();
+                    l4_01_body = body;
+                    t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
+                }
             }
             Err(e) => t.fail(e),
         }
     }
 
-    // L4-02 MUST "Response fields" - validate L4-01's response, no re-issue
+    // L4-02 MUST "Response fields"
     {
         let t = runner.must("L4-02", 4, "Composition response fields");
         if l4_01_body.is_empty() {
@@ -142,18 +115,18 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             "g2",
             &[data.config.sha256.as_str(), data.hello.sha256.as_str()],
         ) {
-            Ok((200, body, trace)) => {
-                t.trace(trace);
-                let c = json_get(&body, "composed").unwrap_or_default();
-                if c == composed_kappa {
-                    t.pass();
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    let c = json_get(&r.body_text(), "composed").unwrap_or_default();
+                    if c == composed_kappa {
+                        t.pass();
+                    } else {
+                        t.fail(format!("g2(b,a) != g2(a,b): {c} vs {composed_kappa}"));
+                    }
                 } else {
-                    t.fail(format!("g2(b,a) != g2(a,b): {c} vs {composed_kappa}"));
+                    t.fail(r.fail_msg(200));
                 }
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 200, got {s}"));
             }
             Err(e) => t.fail(e),
         }
@@ -163,16 +136,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-04", 4, "Composed blob retrievable");
         if composed_kappa.is_empty() {
-            t.fail("no composed κ".into());
+            t.fail("no composed kappa".into());
         } else {
             let path = format!("/v2/{ns}/blobs/{composed_kappa}");
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 200 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(200));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -180,30 +153,26 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-05 MUST "Composed-of edges" - capture response for L4-06
+    // L4-05 MUST "Composed-of edges"
     let mut l4_05_body = String::new();
     {
         let mut t = runner.must("L4-05", 4, "Composed-of edges created");
         if composed_kappa.is_empty() {
-            t.fail("no composed κ".into());
+            t.fail("no composed kappa".into());
         } else {
             let path =
                 format!("/v2/{ns}/edges/{composed_kappa}?direction=outbound&relation=composed-of");
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    match resp.text() {
-                        Ok(body) => {
-                            let has_a = body.contains(data.hello.sha256.as_str());
-                            let has_b = body.contains(data.config.sha256.as_str());
-                            if has_a && has_b {
-                                l4_05_body = body;
-                                t.pass();
-                            } else {
-                                t.fail(format!("composed-of edges missing operands: {body}"));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    let body = r.body_text();
+                    let has_a = body.contains(data.hello.sha256.as_str());
+                    let has_b = body.contains(data.config.sha256.as_str());
+                    if has_a && has_b {
+                        l4_05_body = body;
+                        t.pass();
+                    } else {
+                        t.fail(format!("composed-of edges missing operands: {body}"));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -211,7 +180,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-06 MUST "Edge metadata operation" - verify "g2" in edge metadata from L4-05 response
+    // L4-06 MUST "Edge metadata operation"
     {
         let t = runner.must("L4-06", 4, "Edge metadata includes operation type");
         if l4_05_body.is_empty() {
@@ -225,27 +194,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-07 MUST "Witness retrievable" - capture response for L4-08
+    // L4-07 MUST "Witness retrievable"
     let mut witness_body: Option<Vec<u8>> = None;
     {
         let mut t = runner.must("L4-07", 4, "Witness retrievable");
         if composed_kappa.is_empty() {
-            t.fail("no composed κ".into());
+            t.fail("no composed kappa".into());
         } else {
             let path = format!("/v2/{ns}/witnesses/{composed_kappa}");
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                        t.fail(e);
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 200 {
+                        t.fail(r.fail_msg(200));
                     } else {
-                        match resp.bytes() {
-                            Ok(body) => {
-                                witness_body = Some(body.to_vec());
-                                t.pass();
-                            }
-                            Err(e) => t.fail(format!("body read failed: {e}")),
-                        }
+                        witness_body = Some(r.body.clone());
+                        t.pass();
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -253,9 +217,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-08 MUST "Witness header" - validate from L4-07's captured body, no re-fetch
+    // L4-08 MUST "Witness header and payload verification"
     {
-        let t = runner.must("L4-08", 4, "Witness self-describing header");
+        let t = runner.must(
+            "L4-08",
+            4,
+            "Witness self-describing header and payload re-hash",
+        );
         match &witness_body {
             Some(body) => {
                 if body.len() < 6 {
@@ -263,10 +231,34 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 } else {
                     let lw = u16::from_le_bytes([body[0], body[1]]);
                     let fw = u16::from_le_bytes([body[2], body[3]]);
-                    if lw == 71 && fw == 32 {
-                        t.pass();
-                    } else {
+                    if lw != 71 || fw != 32 {
                         t.fail(format!("header: label_width={lw} fingerprint_width={fw}"));
+                    } else {
+                        let payload = &body[6..];
+                        if payload.is_empty() {
+                            t.fail("witness payload is empty".into());
+                        } else if composed_kappa.is_empty() {
+                            t.fail("no composed kappa to verify against".into());
+                        } else {
+                            let axis = composed_kappa.split(':').next().unwrap_or("sha256");
+                            let re_hashed = match axis {
+                                "sha256" => KappaLabel::sha256(payload),
+                                "blake3" => KappaLabel::blake3(payload),
+                                _ => {
+                                    t.fail(format!("unsupported axis for witness re-hash: {axis}"));
+                                    return;
+                                }
+                            };
+                            if re_hashed.as_str() == composed_kappa {
+                                t.pass();
+                            } else {
+                                t.fail(format!(
+                                    "witness payload re-hash {} does not match composed {}",
+                                    re_hashed.as_str(),
+                                    composed_kappa
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -274,28 +266,24 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-09 MUST "Witness-of edge" - verify witness_kappa appears as source
+    // L4-09 MUST "Witness-of edge"
     {
         let mut t = runner.must("L4-09", 4, "Witness-of edge exists");
         if composed_kappa.is_empty() || witness_kappa.is_empty() {
-            t.fail("no composed or witness κ".into());
+            t.fail("no composed or witness kappa".into());
         } else {
             let path =
                 format!("/v2/{ns}/edges/{composed_kappa}?direction=inbound&relation=witness-of");
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains(&witness_kappa) {
-                                t.pass();
-                            } else {
-                                t.fail(format!(
-                                    "witness κ {witness_kappa} not in edge results: {body}"
-                                ));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    let body = r.body_text();
+                    if body.contains(&witness_kappa) {
+                        t.pass();
+                    } else {
+                        t.fail(format!(
+                            "witness kappa {witness_kappa} not in edge results: {body}"
+                        ));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -305,7 +293,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // L4-10 MUST "Cross-axis rejected"
     let mut l4_10_body = String::new();
-    let mut l4_10_traces: Vec<crate::client::HttpTrace> = Vec::new();
+    let mut l4_10_trace: Option<crate::client::HttpTrace> = None;
     {
         let mut t = runner.must("L4-10", 4, "Cross-axis composition rejected");
         match compose(
@@ -314,15 +302,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             "g2",
             &[data.hello.sha256.as_str(), data.hello.blake3.as_str()],
         ) {
-            Ok((422, body, trace)) => {
-                l4_10_traces.push(trace.clone());
-                l4_10_body = body;
-                t.trace(trace);
-                t.pass();
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 422, got {s}"));
+            Ok(r) => {
+                l4_10_trace = Some(r.trace.clone());
+                l4_10_body = r.body_text();
+                t.trace(r.trace.clone());
+                if r.status == 422 {
+                    t.pass();
+                } else {
+                    t.fail(r.fail_msg(422));
+                }
             }
             Err(e) => t.fail(e),
         }
@@ -331,7 +319,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     // L4-11 MUST "AXIS_MISMATCH code"
     {
         let mut t = runner.must("L4-11", 4, "Axis mismatch error code");
-        for tr in &l4_10_traces {
+        if let Some(tr) = &l4_10_trace {
             t.trace(tr.clone());
         }
         if l4_10_body.is_empty() {
@@ -351,14 +339,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-20", 4, "F4 composition");
         match compose(client, ns, "f4", &[data.hello.sha256.as_str()]) {
-            Ok((200, body, trace)) => {
-                t.trace(trace);
-                f4_kappa = json_get(&body, "composed").unwrap_or_default();
-                t.pass();
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 200, got {s}"));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    f4_kappa = json_get(&r.body_text(), "composed").unwrap_or_default();
+                    t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
+                }
             }
             Err(e) => t.fail(e),
         }
@@ -369,18 +357,18 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L4-21", 4, "F4 mirror collapse");
         let complement = data.hello.sha256.complement();
         match compose(client, ns, "f4", &[complement.as_str()]) {
-            Ok((200, body, trace)) => {
-                t.trace(trace);
-                let c = json_get(&body, "composed").unwrap_or_default();
-                if c == f4_kappa {
-                    t.pass();
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    let c = json_get(&r.body_text(), "composed").unwrap_or_default();
+                    if c == f4_kappa {
+                        t.pass();
+                    } else {
+                        t.fail(format!("f4(mirror) != f4(original): {c} vs {f4_kappa}"));
+                    }
                 } else {
-                    t.fail(format!("f4(mirror) != f4(original): {c} vs {f4_kappa}"));
+                    t.fail(r.fail_msg(200));
                 }
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 200, got {s}"));
             }
             Err(e) => t.fail(e),
         }
@@ -392,14 +380,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-22", 4, "E6 composition");
         match compose(client, ns, "e6", &[data.hello.sha256.as_str()]) {
-            Ok((200, body, trace)) => {
-                t.trace(trace);
-                e6_kappa = json_get(&body, "composed").unwrap_or_default();
-                t.pass();
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 200, got {s}"));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    e6_kappa = json_get(&r.body_text(), "composed").unwrap_or_default();
+                    t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
+                }
             }
             Err(e) => t.fail(e),
         }
@@ -409,7 +397,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-23", 4, "E6 tag byte correct");
         if e6_kappa.is_empty() {
-            t.fail("no e6 κ".into());
+            t.fail("no e6 kappa".into());
         } else {
             let hex_str = data.hello.sha256.as_str();
             let first_hex = &hex_str[7..9];
@@ -418,22 +406,17 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             let expected_tag: u8 = if class <= 7 { 0x05 } else { 0x06 };
             let path = format!("/v2/{ns}/blobs/{e6_kappa}");
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    match resp.bytes() {
-                        Ok(body) => {
-                            if body.is_empty() {
-                                t.fail("empty e6 blob".into());
-                            } else if body[0] == expected_tag {
-                                t.pass();
-                            } else {
-                                t.fail(format!(
-                                    "expected tag 0x{expected_tag:02x}, got 0x{:02x}",
-                                    body[0]
-                                ));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.body.is_empty() {
+                        t.fail("empty e6 blob".into());
+                    } else if r.body[0] == expected_tag {
+                        t.pass();
+                    } else {
+                        t.fail(format!(
+                            "expected tag 0x{expected_tag:02x}, got 0x{:02x}",
+                            r.body[0]
+                        ));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -441,19 +424,19 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-24 MUST "E7 compose" - capture e7_kappa for coincidence detection
+    // L4-24 MUST "E7 compose"
     let mut e7_kappa = String::new();
     {
         let mut t = runner.must("L4-24", 4, "E7 composition");
         match compose(client, ns, "e7", &[data.hello.sha256.as_str()]) {
-            Ok((200, body, trace)) => {
-                t.trace(trace);
-                e7_kappa = json_get(&body, "composed").unwrap_or_default();
-                t.pass();
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 200, got {s}"));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    e7_kappa = json_get(&r.body_text(), "composed").unwrap_or_default();
+                    t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
+                }
             }
             Err(e) => t.fail(e),
         }
@@ -465,14 +448,14 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-25", 4, "E8 composition");
         match compose(client, ns, "e8", &[data.hello.sha256.as_str()]) {
-            Ok((200, body, trace)) => {
-                t.trace(trace);
-                e8_kappa = json_get(&body, "composed").unwrap_or_default();
-                t.pass();
-            }
-            Ok((s, _, trace)) => {
-                t.trace(trace);
-                t.fail(format!("expected 200, got {s}"));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
+                    e8_kappa = json_get(&r.body_text(), "composed").unwrap_or_default();
+                    t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
+                }
             }
             Err(e) => t.fail(e),
         }
@@ -482,37 +465,32 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let t = runner.must("L4-26", 4, "E8 differs from operand");
         if e8_kappa == data.hello.sha256.as_str() {
-            t.fail("e8 κ equals operand κ".into());
+            t.fail("e8 kappa equals operand kappa".into());
         } else {
             t.pass();
         }
     }
 
-    // L4-27 MAY "Coincidence documented" - check for actual digest coincidence
+    // L4-27 MAY "Coincidence documented"
     {
         let t = runner.may("L4-27", 4, "F4/E7/E8 coincidence documented");
-        // Extract digest portions (after the colon) and compare.
         let f4_digest = f4_kappa.split(':').nth(1).unwrap_or("");
         let e7_digest = e7_kappa.split(':').nth(1).unwrap_or("");
         let e8_digest = e8_kappa.split(':').nth(1).unwrap_or("");
-        let mut coincidences = Vec::new();
+        let mut _coincidences = Vec::<&str>::new();
         if !f4_digest.is_empty() && f4_digest == e8_digest {
-            coincidences.push("F4/E8");
+            _coincidences.push("F4/E8");
         }
         if !e7_digest.is_empty() && e7_digest == e8_digest {
-            coincidences.push("E7/E8");
+            _coincidences.push("E7/E8");
         }
         if !f4_digest.is_empty() && !e7_digest.is_empty() && f4_digest == e7_digest {
-            coincidences.push("F4/E7");
+            _coincidences.push("F4/E7");
         }
-        if coincidences.is_empty() {
-            t.pass(); // No coincidence - informational pass.
-        } else {
-            t.pass(); // Coincidence observed - informational pass, logged.
-        }
+        t.pass();
     }
 
-    // L4-28 MUST "Coincidence disambiguated" - if coincidence, verify edge metadata distinguishes
+    // L4-28 MUST "Coincidence disambiguated"
     {
         let f4_digest = f4_kappa.split(':').nth(1).unwrap_or("");
         let e7_digest = e7_kappa.split(':').nth(1).unwrap_or("");
@@ -530,7 +508,6 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 )
                 .pass();
         } else {
-            // Verify the edge metadata for one of the coincident κ-labels contains the operation type.
             let check_kappa = if !f4_digest.is_empty() && f4_digest == e8_digest {
                 &f4_kappa
             } else {
@@ -540,23 +517,18 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             let path =
                 format!("/v2/{ns}/edges/{check_kappa}?direction=outbound&relation=composed-of");
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    match resp.text() {
-                        Ok(body) => {
-                            // The metadata should contain the operation type (f4, e7, or e8).
-                            let has_op = body.contains("\"f4\"")
-                                || body.contains("\"e7\"")
-                                || body.contains("\"e8\"");
-                            if has_op {
-                                t.pass();
-                            } else {
-                                t.fail(format!(
-                                    "coincident edge metadata missing operation type: {body}"
-                                ));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    let body = r.body_text();
+                    let has_op = body.contains("\"f4\"")
+                        || body.contains("\"e7\"")
+                        || body.contains("\"e8\"");
+                    if has_op {
+                        t.pass();
+                    } else {
+                        t.fail(format!(
+                            "coincident edge metadata missing operation type: {body}"
+                        ));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -573,21 +545,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-40", 4, "Schema registration");
         let rb = client
-            .put(&format!("/v2/{ns}/schemas/test-scope"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/schemas/test-scope"), "application/json")
             .body(schema_content);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 201) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 {
+                    t.fail(r.fail_msg(201));
                 } else {
-                    schema_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+                    schema_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
                 }
             }
@@ -595,32 +561,24 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-41 MUST "Schema retrieve" - verify body content and X-Kappa-Label
+    // L4-41 MUST "Schema retrieve"
     {
         let mut t = runner.must("L4-41", 4, "Schema retrieval (body + header)");
         match client.send_traced(client.get(&format!("/v2/{ns}/schemas/test-scope"))) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
                 } else {
-                    let h = hdrs(&resp);
-                    let server_label = hdr_val(&h, "x-kappa-label").unwrap_or("").to_string();
+                    let server_label = r.header("x-kappa-label").unwrap_or("").to_string();
                     if !schema_kappa.is_empty() && server_label != schema_kappa {
                         t.fail(format!(
                             "X-Kappa-Label mismatch: {server_label} vs {schema_kappa}"
                         ));
+                    } else if let Err(e) = assert_body_eq(&r.body, schema_content.as_bytes()) {
+                        t.fail(e);
                     } else {
-                        match resp.bytes() {
-                            Ok(body) => {
-                                if let Err(e) = assert_body_eq(&body, schema_content.as_bytes()) {
-                                    t.fail(e);
-                                } else {
-                                    t.pass();
-                                }
-                            }
-                            Err(e) => t.fail(format!("body read failed: {e}")),
-                        }
+                        t.pass();
                     }
                 }
             }
@@ -632,20 +590,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-42", 4, "Schema listing");
         match client.send_traced(client.get(&format!("/v2/{ns}/schemas/"))) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
                 } else {
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains("test-scope") {
-                                t.pass();
-                            } else {
-                                t.fail("test-scope not in schema list".into());
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                    let body = r.body_text();
+                    if body.contains("test-scope") {
+                        t.pass();
+                    } else {
+                        t.fail("test-scope not in schema list".into());
                     }
                 }
             }
@@ -659,21 +613,18 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L4-43", 4, "Valid content accepted under schema");
         let rb = client
-            .put(&format!("/v2/{ns}/manifests/schema-pass"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(
+                &format!("/v2/{ns}/manifests/schema-pass"),
+                "application/json",
+            )
             .body(r#"{"name":"valid"}"#);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 201) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 {
+                    t.fail(r.fail_msg(201));
                 } else {
-                    valid_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+                    valid_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
                 }
             }
@@ -681,33 +632,31 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L4-44 MUST "Invalid rejected" - verify SCHEMA_VIOLATION error code
+    // L4-44 MUST "Invalid rejected"
     {
         let mut t = runner.must("L4-44", 4, "Invalid content rejected under schema");
         let rb = client
-            .put(&format!("/v2/{ns}/manifests/schema-fail"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(
+                &format!("/v2/{ns}/manifests/schema-fail"),
+                "application/json",
+            )
             .body(r#"{"not_name":"invalid"}"#);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 422 {
-                    match resp.bytes() {
-                        Ok(body) => {
-                            if let Err(e) = verify_error_response(&body, "SCHEMA_VIOLATION") {
-                                // Some registries use FILTER_REJECTED - warn, don't fail.
-                                t.warn(format!("status 422 but error code wrong: {e}"));
-                            } else {
-                                t.pass();
-                            }
-                        }
-                        Err(_) => t.pass(), // Status correct, body unreadable - pass on status.
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 422 {
+                    if let Err(e) = verify_error_response(&r.body, "SCHEMA_VIOLATION") {
+                        t.fail(format!("status 422 but error code wrong: {e}"));
+                    } else {
+                        t.pass();
                     }
-                } else if s == 201 || s == 200 {
-                    t.warn("schema validation not enforced (content accepted)".into());
+                } else if r.status == 201 || r.status == 200 {
+                    t.fail(format!(
+                        "schema validation not enforced (content accepted): {}",
+                        r.body_text()
+                    ));
                 } else {
-                    t.fail(format!("expected 422, got {s}"));
+                    t.fail(r.fail_msg(422));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -720,35 +669,38 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let rejected_kappa = KappaLabel::sha256(br#"{"not_name":"invalid"}"#);
         let path = format!("/v2/{ns}/blobs/{}", rejected_kappa.as_str());
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 404 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 404 {
                     t.pass();
                 } else {
-                    t.warn(format!("rejected content found (schema not enforced): {s}"));
+                    t.fail(format!(
+                        "rejected content found (schema not enforced): {}: {}",
+                        r.status,
+                        r.body_text()
+                    ));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 
-    // L4-46 MUST "Schema ≠ κ-modifier"
+    // L4-46 MUST "Schema does not alter kappa-label"
     {
-        let mut t = runner.must("L4-46", 4, "Schema does not alter κ-label");
+        let mut t = runner.must("L4-46", 4, "Schema does not alter kappa-label");
         let expected = KappaLabel::sha256(br#"{"name":"valid"}"#);
         let unscoped_path = format!("/v2/{ns}-noscope/blobs/{}", expected.as_str());
         let rb = client
             .put(&unscoped_path)
             .body(br#"{"name":"valid"}"#.to_vec());
         match client.send_traced(rb) {
-            Ok((_, trace)) => {
-                t.trace(trace);
+            Ok(r) => {
+                t.trace(r.trace.clone());
                 if valid_kappa == expected.as_str() {
                     t.pass();
                 } else {
                     t.fail(format!(
-                        "schema altered κ: scoped={valid_kappa}, expected={}",
+                        "schema altered kappa: scoped={valid_kappa}, expected={}",
                         expected.as_str()
                     ));
                 }
@@ -763,26 +715,19 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.should("L4-47", 4, "Schema evolution with edge");
         let updated = r#"{"scope":"test-scope","format":"json-schema","validation":{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"description":{"type":"string"}}}}"#;
         let rb = client
-            .put(&format!("/v2/{ns}/schemas/test-scope"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/schemas/test-scope"), "application/json")
             .body(updated);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 201 {
-                    new_schema_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 {
+                    new_schema_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
                 } else {
-                    t.warn(format!("schema evolution returned {s}"));
+                    t.fail(r.fail_msg(201));
                 }
             }
-            Err(e) => t.warn(format!("request failed: {e}")),
+            Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 
@@ -801,19 +746,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 "/v2/{ns}/edges/{new_schema_kappa}?direction=outbound&relation=derives-from"
             );
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains(&schema_kappa) {
-                                t.pass();
-                            } else {
-                                t.warn(format!(
-                                    "derives-from edge to old schema not found: {body}"
-                                ));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    let body = r.body_text();
+                    if body.contains(&schema_kappa) {
+                        t.pass();
+                    } else {
+                        t.fail(format!("derives-from edge to old schema not found: {body}"));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),

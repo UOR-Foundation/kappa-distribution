@@ -10,26 +10,6 @@ use crate::kappa::KappaLabel;
 use crate::runner::TestRunner;
 use crate::testdata::TestData;
 
-/// Helper: extract headers as lowercase key-value pairs from a response.
-fn hdrs(resp: &reqwest::blocking::Response) -> Vec<(String, String)> {
-    resp.headers()
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_lowercase(),
-                v.to_str().unwrap_or("").to_string(),
-            )
-        })
-        .collect()
-}
-
-fn hdr_val<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.as_str())
-}
-
 pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, data: &TestData) {
     let ns = &config.namespace;
 
@@ -37,12 +17,11 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     for blob in [&data.hello, &data.config, &data.layer_a, &data.layer_b] {
         let path = format!("/v2/{ns}/blobs/{}", blob.sha256.as_str());
         let rb = client.put(&path).body(blob.content.to_vec());
-        if let Ok((resp, _)) = client.send_traced(rb) {
-            let s = resp.status().as_u16();
-            if s != 201 && s != 200 {
+        if let Ok(r) = client.send_traced(rb) {
+            if r.status != 201 && r.status != 200 {
                 eprintln!(
-                    "Level 3 setup: blob {} push returned {s}, aborting level",
-                    blob.name
+                    "Level 3 setup: blob {} push returned {}, aborting level",
+                    blob.name, r.status
                 );
                 return;
             }
@@ -55,9 +34,6 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     let rb = client.put(&mm_path).body(data.multi_manifest.clone());
     let _ = client.send_traced(rb);
 
-    // Independently compute the expected edge κ-label for derives-from edge.
-    // Edge canonical form: source ‖ 0x00 ‖ relation ‖ 0x00 ‖ target ‖ 0x00 ‖ u32-BE(1) ‖ 0xA0
-    // 0xA0 is CBOR empty map (RFC 8949 §4.2 deterministic encoding of {}).
     let expected_edge_bytes = edge_canon::encode_edge(
         &data.simple_manifest_sha256,
         "derives-from",
@@ -77,22 +53,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.config.sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if let Err(e) = assert_status_in(s, &[201, 200]) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 && r.status != 200 {
+                    t.fail(r.fail_msg(201));
                 } else {
-                    edge_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+                    edge_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
                 }
             }
@@ -100,16 +69,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L3-02 MUST "Edge κ in response"
+    // L3-02 MUST "Edge kappa in response"
     {
-        let t = runner.must("L3-02", 3, "Edge κ-label in response matches expected");
+        let t = runner.must("L3-02", 3, "Edge kappa-label in response matches expected");
         if edge_kappa.is_empty() {
-            t.fail("no edge κ from L3-01".into());
+            t.fail("no edge kappa from L3-01".into());
         } else if let Err(e) = assert_kappa_valid(&edge_kappa) {
-            t.fail(format!("invalid κ: {e}"));
+            t.fail(format!("invalid kappa: {e}"));
         } else if edge_kappa != expected_edge_kappa.as_str() {
             t.fail(format!(
-                "edge κ wrong: server={edge_kappa}, independently computed={}",
+                "edge kappa wrong: server={edge_kappa}, independently computed={}",
                 expected_edge_kappa.as_str()
             ));
         } else {
@@ -122,29 +91,26 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L3-03", 3, "Edge retrievable as blob");
         if edge_kappa.is_empty() {
-            t.fail("no edge κ".into());
+            t.fail("no edge kappa".into());
         } else {
             let path = format!("/v2/{ns}/blobs/{edge_kappa}");
             let kappa_parsed = assert_kappa_valid(&edge_kappa);
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                        t.fail(e);
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 200 {
+                        t.fail(r.fail_msg(200));
                     } else {
-                        match resp.bytes() {
-                            Ok(body) => match &kappa_parsed {
-                                Ok(expected) => {
-                                    if let Err(e) = assert_kappa_matches(&body, expected) {
-                                        t.fail(e);
-                                    } else {
-                                        edge_body = Some(body.to_vec());
-                                        t.pass();
-                                    }
+                        match &kappa_parsed {
+                            Ok(expected) => {
+                                if let Err(e) = assert_kappa_matches(&r.body, expected) {
+                                    t.fail(e);
+                                } else {
+                                    edge_body = Some(r.body.clone());
+                                    t.pass();
                                 }
-                                Err(e) => t.fail(format!("cannot verify: {e}")),
-                            },
-                            Err(e) => t.fail(format!("body read failed: {e}")),
+                            }
+                            Err(e) => t.fail(format!("cannot verify: {e}")),
                         }
                     }
                 }
@@ -158,9 +124,6 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let t = runner.must("L3-04", 3, "Edge canonical form correct");
         match &edge_body {
             Some(body) => {
-                // The edge was created with "metadata":{} in JSON. Per RFC 8949 §4.2
-                // deterministic encoding, an empty JSON object maps to CBOR empty map 0xA0
-                // (major type 5, additional info 0). This is unambiguous.
                 if let Err(e) = assert_body_eq(body, &expected_edge_bytes) {
                     t.fail(e);
                 } else {
@@ -179,20 +142,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.simple_manifest_sha256.as_str()
         );
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
                 } else {
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains(data.config.sha256.as_str()) {
-                                t.pass();
-                            } else {
-                                t.fail(format!("target not in results: {body}"));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                    let body = r.body_text();
+                    if body.contains(data.config.sha256.as_str()) {
+                        t.pass();
+                    } else {
+                        t.fail(format!("target not in results: {body}"));
                     }
                 }
             }
@@ -208,20 +167,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.config.sha256.as_str()
         );
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
                 } else {
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains(data.simple_manifest_sha256.as_str()) {
-                                t.pass();
-                            } else {
-                                t.fail(format!("source not in results: {body}"));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                    let body = r.body_text();
+                    if body.contains(data.simple_manifest_sha256.as_str()) {
+                        t.pass();
+                    } else {
+                        t.fail(format!("source not in results: {body}"));
                     }
                 }
             }
@@ -237,27 +192,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.simple_manifest_sha256.as_str()
         );
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
                 } else {
-                    match resp.text() {
-                        Ok(body) => {
-                            let v: serde_json::Value =
-                                serde_json::from_str(&body).unwrap_or_default();
-                            let edges = v
-                                .get("edges")
-                                .and_then(|e| e.as_array())
-                                .map(|a| a.len())
-                                .unwrap_or(0);
-                            if edges == 0 {
-                                t.pass();
-                            } else {
-                                t.fail(format!("expected 0 'owns' edges, got {edges}"));
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                    let body = r.body_text();
+                    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let edges = v
+                        .get("edges")
+                        .and_then(|e| e.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if edges == 0 {
+                        t.pass();
+                    } else {
+                        t.fail(format!("expected 0 'owns' edges, got {edges}"));
                     }
                 }
             }
@@ -273,20 +223,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.config.sha256.as_str()
         );
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
                 } else {
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains("derives-from") {
-                                t.pass();
-                            } else {
-                                t.fail("derives-from edge not in both results".into());
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                    let body = r.body_text();
+                    if body.contains("derives-from") {
+                        t.pass();
+                    } else {
+                        t.fail("derives-from edge not in both results".into());
                     }
                 }
             }
@@ -303,18 +249,18 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.config.sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let h = hdrs(&resp);
-                let ek = hdr_val(&h, "x-kappa-label").unwrap_or("");
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                let ek = r.header("x-kappa-label").unwrap_or("");
                 if ek == edge_kappa {
                     t.pass();
                 } else {
-                    t.fail(format!("idempotent edge κ mismatch: {ek} vs {edge_kappa}"));
+                    t.fail(format!(
+                        "idempotent edge kappa mismatch: {ek} vs {edge_kappa}"
+                    ));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -334,29 +280,17 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.hello.sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s < 400 {
-                    t.fail(format!("expected 4xx, got {s}"));
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status < 400 {
+                    t.fail(format!("expected 4xx, got {}: {}", r.status, r.body_text()));
+                } else if let Err(e) = verify_error_response(&r.body, "EDGE_SOURCE_ABSENT") {
+                    t.fail(format!("status {} but error code wrong: {e}", r.status));
                 } else {
-                    match resp.bytes() {
-                        Ok(body) => {
-                            if let Err(e) = verify_error_response(&body, "EDGE_SOURCE_ABSENT") {
-                                t.fail(format!("status {s} but error code wrong: {e}"));
-                            } else {
-                                t.pass();
-                            }
-                        }
-                        Err(_) => {
-                            // Status was 4xx but body unreadable - pass on status, warn on body.
-                            t.pass();
-                        }
-                    }
+                    t.pass();
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -372,16 +306,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.hello.sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -390,13 +323,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // L3-12 MUST "Axis matches source"
     {
-        let t = runner.must("L3-12", 3, "Edge κ-label axis matches source");
+        let t = runner.must("L3-12", 3, "Edge kappa-label axis matches source");
         let expected_prefix = format!("{}:", data.simple_manifest_sha256.axis());
         if edge_kappa.starts_with(&expected_prefix) {
             t.pass();
         } else {
             t.fail(format!(
-                "edge κ axis does not match source axis '{}': {edge_kappa}",
+                "edge kappa axis does not match source axis '{}': {edge_kappa}",
                 data.simple_manifest_sha256.axis()
             ));
         }
@@ -412,21 +345,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.simple_manifest_sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 && r.status != 200 {
+                    t.fail(r.fail_msg(201));
                 } else {
-                    referrer_edge_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+                    referrer_edge_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
                 }
             }
@@ -438,31 +365,27 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L3-14", 3, "Referrer edge queryable");
         if referrer_edge_kappa.is_empty() {
-            t.fail("referrer edge κ-label not captured from L3-13".into());
+            t.fail("referrer edge kappa-label not captured from L3-13".into());
         } else {
             let path = format!(
                 "/v2/{ns}/edges/{}?direction=inbound&relation=refers-to",
                 data.simple_manifest_sha256.as_str()
             );
             match client.send_traced(client.get(&path)) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                        t.fail(e);
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 200 {
+                        t.fail(r.fail_msg(200));
                     } else {
-                        match resp.text() {
-                            Ok(body) => {
-                                let has_source = body.contains(data.multi_manifest_sha256.as_str());
-                                let has_edge = body.contains(&referrer_edge_kappa);
-                                if has_source && has_edge {
-                                    t.pass();
-                                } else {
-                                    t.fail(format!(
-                                        "referrer edge not fully in results (source={has_source} edge_kappa={has_edge})"
-                                    ));
-                                }
-                            }
-                            Err(e) => t.fail(format!("body read failed: {e}")),
+                        let body = r.body_text();
+                        let has_source = body.contains(data.multi_manifest_sha256.as_str());
+                        let has_edge = body.contains(&referrer_edge_kappa);
+                        if has_source && has_edge {
+                            t.pass();
+                        } else {
+                            t.fail(format!(
+                                "referrer edge not fully in results (source={has_source} edge_kappa={has_edge})"
+                            ));
                         }
                     }
                 }
@@ -480,16 +403,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.hello.sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -502,20 +424,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let absent_subject = format!("sha256:{}", "c".repeat(64));
         let path = format!("/v2/{ns}/edges/{absent_subject}?direction=inbound");
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
                 } else {
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains(data.hello.sha256.as_str()) {
-                                t.pass();
-                            } else {
-                                t.fail("edge to absent subject not queryable".into());
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                    let body = r.body_text();
+                    if body.contains(data.hello.sha256.as_str()) {
+                        t.pass();
+                    } else {
+                        t.fail("edge to absent subject not queryable".into());
                     }
                 }
             }
@@ -531,12 +449,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.simple_manifest_sha256.as_str()
         );
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if resp.status().as_u16() == 200 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
                     t.pass();
                 } else {
-                    t.warn(format!("edge pagination returned {}", resp.status()));
+                    t.warn(format!("edge pagination returned {}", r.status));
                 }
             }
             Err(e) => t.warn(format!("request failed: {e}")),
@@ -553,29 +471,23 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.config.sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((create_resp, create_trace)) => {
-                t.trace(create_trace);
-                sac_kappa = create_resp
-                    .headers()
-                    .get("x-kappa-label")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
+            Ok(cr) => {
+                t.trace(cr.trace.clone());
+                sac_kappa = cr.header("x-kappa-label").unwrap_or("").to_string();
                 if sac_kappa.is_empty() {
-                    t.fail("no edge κ from sacrificial edge create".into());
+                    t.fail("no edge kappa from sacrificial edge create".into());
                 } else {
                     match client.send_traced(client.delete(&format!("/v2/{ns}/edges/{sac_kappa}")))
                     {
-                        Ok((del_resp, del_trace)) => {
-                            t.trace(del_trace);
-                            if let Err(e) = assert_status(del_resp.status().as_u16(), 202) {
-                                t.fail(e);
-                            } else {
+                        Ok(dr) => {
+                            t.trace(dr.trace.clone());
+                            if dr.status == 202 {
                                 t.pass();
+                            } else {
+                                t.fail(dr.fail_msg(202));
                             }
                         }
                         Err(e) => t.fail(format!("delete failed: {e}")),
@@ -590,37 +502,30 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L3-21", 3, "Deleted edge absent from queries");
         // The sacrificial edge was hello -> config with relation "sacrificial".
-        // Query hello's outbound edges for relation "sacrificial" - it should be gone.
         let path = format!(
             "/v2/{ns}/edges/{}?direction=outbound&relation=sacrificial",
             data.hello.sha256.as_str()
         );
         match client.send_traced(client.get(&path)) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                match resp.text() {
-                    Ok(body) => {
-                        if !sac_kappa.is_empty() && body.contains(&sac_kappa) {
-                            t.fail("deleted edge still in query results".into());
-                        } else {
-                            // Also verify the edge κ-label itself is not present.
-                            let v: serde_json::Value =
-                                serde_json::from_str(&body).unwrap_or_default();
-                            let edges = v
-                                .get("edges")
-                                .and_then(|e| e.as_array())
-                                .map(|a| a.len())
-                                .unwrap_or(0);
-                            if edges == 0 {
-                                t.pass();
-                            } else {
-                                t.fail(format!(
-                                    "expected 0 sacrificial edges after delete, got {edges}"
-                                ));
-                            }
-                        }
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                let body = r.body_text();
+                if !sac_kappa.is_empty() && body.contains(&sac_kappa) {
+                    t.fail("deleted edge still in query results".into());
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let edges = v
+                        .get("edges")
+                        .and_then(|e| e.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if edges == 0 {
+                        t.pass();
+                    } else {
+                        t.fail(format!(
+                            "expected 0 sacrificial edges after delete, got {edges}"
+                        ));
                     }
-                    Err(e) => t.fail(format!("body read failed: {e}")),
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -641,16 +546,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             client.send_traced(client.head(&source_path)),
             client.send_traced(client.head(&target_path)),
         ) {
-            (Ok((r1, t1)), Ok((r2, t2))) => {
-                t.trace(t1);
-                t.trace(t2);
-                let s1 = r1.status().as_u16();
-                let s2 = r2.status().as_u16();
-                if s1 == 200 && s2 == 200 {
+            (Ok(r1), Ok(r2)) => {
+                t.trace(r1.trace.clone());
+                t.trace(r2.trace.clone());
+                if r1.status == 200 && r2.status == 200 {
                     t.pass();
                 } else {
                     t.fail(format!(
-                        "blobs deleted after edge delete: source={s1}, target={s2}"
+                        "blobs deleted after edge delete: source={}, target={}",
+                        r1.status, r2.status
                     ));
                 }
             }

@@ -12,15 +12,26 @@ use crate::runner::TestRunner;
 use crate::testdata::TestData;
 use std::time::{Duration, Instant};
 
-fn poll_sweep(client: &RegistryClient, ns: &str, timeout_secs: u64) -> bool {
+fn poll_sweep(
+    client: &RegistryClient,
+    ns: &str,
+    timeout_secs: u64,
+    previous_sweep_id: Option<&str>,
+) -> bool {
     let start = Instant::now();
     loop {
-        if let Ok((resp, _)) = client.send_traced(client.get(&format!("/v2/{ns}/gc/status"))) {
-            if resp.status().as_u16() == 200 {
-                if let Ok(body) = resp.text() {
-                    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                    if v.get("last_sweep").and_then(|s| s.as_str()).is_some() {
-                        return true;
+        if let Ok(r) = client.send_traced(client.get(&format!("/v2/{ns}/gc/status"))) {
+            if r.status == 200 {
+                let body = r.body_text();
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                if let Some(current) = v.get("last_sweep").and_then(|s| s.as_str()) {
+                    match previous_sweep_id {
+                        Some(prev) => {
+                            if current != prev {
+                                return true;
+                            }
+                        }
+                        None => return true,
                     }
                 }
             }
@@ -32,6 +43,18 @@ fn poll_sweep(client: &RegistryClient, ns: &str, timeout_secs: u64) -> bool {
     }
 }
 
+fn get_current_sweep_id(client: &RegistryClient, ns: &str) -> Option<String> {
+    if let Ok(r) = client.send_traced(client.get(&format!("/v2/{ns}/gc/status"))) {
+        let body = r.body_text();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        return v
+            .get("last_sweep")
+            .and_then(|s| s.as_str())
+            .map(String::from);
+    }
+    None
+}
+
 pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, data: &TestData) {
     let ns = &config.namespace;
 
@@ -39,12 +62,11 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     for blob in [&data.hello, &data.config, &data.layer_a, &data.layer_b] {
         let path = format!("/v2/{ns}/blobs/{}", blob.sha256.as_str());
         let rb = client.put(&path).body(blob.content.to_vec());
-        if let Ok((resp, _)) = client.send_traced(rb) {
-            let s = resp.status().as_u16();
-            if s != 201 && s != 200 {
+        if let Ok(r) = client.send_traced(rb) {
+            if r.status != 201 && r.status != 200 {
                 eprintln!(
-                    "Level 5 setup: blob {} push returned {s}, aborting level",
-                    blob.name
+                    "Level 5 setup: blob {} push returned {}, aborting level",
+                    blob.name, r.status
                 );
                 return;
             }
@@ -60,21 +82,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L5-01", 5, "Pin creation");
         let body = format!(r#"{{"kappa":"{}","ttl":0}}"#, data.hello.sha256.as_str());
         let rb = client
-            .post(&format!("/v2/{ns}/gc/pin"))
-            .header("Content-Type", "application/json")
+            .post_with_content_type(&format!("/v2/{ns}/gc/pin"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 201) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 {
+                    t.fail(r.fail_msg(201));
                 } else {
-                    pin_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+                    pin_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
                 }
             }
@@ -82,13 +98,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L5-02 MUST "Pin κ in response"
+    // L5-02 MUST "Pin kappa in response"
     {
-        let t = runner.must("L5-02", 5, "Pin response κ-label");
+        let t = runner.must("L5-02", 5, "Pin response kappa-label");
         if pin_kappa.is_empty() {
-            t.fail("no pin κ from L5-01".into());
+            t.fail("no pin kappa from L5-01".into());
         } else if let Err(e) = assert_kappa_valid(&pin_kappa) {
-            t.fail(format!("invalid κ: {e}"));
+            t.fail(format!("invalid kappa: {e}"));
         } else {
             t.pass();
         }
@@ -103,16 +119,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.layer_a.sha256.as_str(),
         );
         let rb = client
-            .put(&format!("/v2/{ns}/edges/"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(&format!("/v2/{ns}/edges/"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -123,9 +138,9 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L5-04", 5, "Remove tag from owned blob");
         match client.send_traced(client.get(&format!("/v2/{ns}/tags/list"))) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let body = resp.text().unwrap_or_default();
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                let body = r.body_text();
                 if !body.contains(data.layer_a.sha256.as_str()) {
                     t.pass();
                 } else {
@@ -140,8 +155,8 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                             let name = tag_entry.get("name").and_then(|n| n.as_str()).unwrap_or("");
                             if kappa == data.layer_a.sha256.as_str() && !name.is_empty() {
                                 let del_rb = client.delete(&format!("/v2/{ns}/manifests/{name}"));
-                                if let Ok((_resp, del_trace)) = client.send_traced(del_rb) {
-                                    t.trace(del_trace);
+                                if let Ok(dr) = client.send_traced(del_rb) {
+                                    t.trace(dr.trace.clone());
                                 }
                                 deleted += 1;
                             }
@@ -167,15 +182,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     }
 
     // L5-05 MUST "Sweep trigger"
+    let pre_sweep_id = get_current_sweep_id(client, ns);
     {
         let mut t = runner.must("L5-05", 5, "GC sweep trigger");
         match client.send_traced(client.post(&format!("/v2/{ns}/gc/sweep"))) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 202) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 202 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(202));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -185,7 +201,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     // L5-06 MUST "Sweep status"
     {
         let t = runner.must("L5-06", 5, "GC status endpoint");
-        if poll_sweep(client, ns, 60) {
+        if poll_sweep(client, ns, 60, pre_sweep_id.as_deref()) {
             t.pass();
         } else {
             t.fail("sweep did not complete within 60 seconds".into());
@@ -198,12 +214,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         match client
             .send_traced(client.get(&format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str())))
         {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -216,12 +232,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         match client
             .send_traced(client.get(&format!("/v2/{ns}/blobs/{}", data.layer_a.sha256.as_str())))
         {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 200 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(200));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -232,20 +248,19 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L5-09", 5, "Unpin");
         if pin_kappa.is_empty() {
-            t.fail("no pin κ".into());
+            t.fail("no pin kappa".into());
         } else {
             let body = format!(r#"{{"pin_kappa":"{pin_kappa}"}}"#);
             let rb = client
-                .post(&format!("/v2/{ns}/gc/unpin"))
-                .header("Content-Type", "application/json")
+                .post_with_content_type(&format!("/v2/{ns}/gc/unpin"), "application/json")
                 .body(body);
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 200 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(200));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -261,15 +276,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     }
 
     // L5-11 MUST "Sweep after unpin"
+    let pre_sweep2_id = get_current_sweep_id(client, ns);
     {
         let mut t = runner.must("L5-11", 5, "Sweep after unpin");
         match client.send_traced(client.post(&format!("/v2/{ns}/gc/sweep"))) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 202) {
-                    t.fail(e);
-                } else {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 202 {
                     t.pass();
+                } else {
+                    t.fail(r.fail_msg(202));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -278,8 +294,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // L5-12 MUST "Poll sweep"
     {
-        let t = runner.must("L5-12", 5, "Sweep completion polling");
-        if poll_sweep(client, ns, 60) {
+        let mut t = runner.must("L5-12", 5, "Sweep completion polling");
+        if poll_sweep(client, ns, 60, pre_sweep2_id.as_deref()) {
+            if let Ok(sr) = client.send_traced(client.get(&format!("/v2/{ns}/gc/status"))) {
+                t.trace(sr.trace.clone());
+                eprintln!("  L5-12 sweep status: {}", sr.body_text());
+            }
             t.pass();
         } else {
             t.fail("sweep did not complete within 60 seconds".into());
@@ -292,12 +312,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         match client
             .send_traced(client.get(&format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str())))
         {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if resp.status().as_u16() == 404 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 404 {
                     t.pass();
                 } else {
-                    t.warn(format!("unpinned blob not yet evicted: {}", resp.status()));
+                    t.fail(format!(
+                        "unpinned blob not yet evicted: {}: {}",
+                        r.status,
+                        r.body_text()
+                    ));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -310,14 +334,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         match client
             .send_traced(client.get(&format!("/v2/{ns}/blobs/{}", data.layer_a.sha256.as_str())))
         {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if resp.status().as_u16() == 404 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 404 {
                     t.pass();
                 } else {
-                    t.warn(format!(
-                        "unreachable blob not yet evicted: {}",
-                        resp.status()
+                    t.fail(format!(
+                        "unreachable blob not yet evicted: {}: {}",
+                        r.status,
+                        r.body_text()
                     ));
                 }
             }
@@ -329,7 +354,6 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     let mut finalizer_pin_kappa = String::new();
     {
         let mut t = runner.must("L5-15", 5, "Finalizer pin creation");
-        // Re-push config if evicted.
         let rb = client
             .put(&format!("/v2/{ns}/blobs/{}", data.config.sha256.as_str()))
             .body(data.config.content.to_vec());
@@ -339,21 +363,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             data.config.sha256.as_str()
         );
         let rb = client
-            .post(&format!("/v2/{ns}/gc/pin"))
-            .header("Content-Type", "application/json")
+            .post_with_content_type(&format!("/v2/{ns}/gc/pin"), "application/json")
             .body(body);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if let Err(e) = assert_status(resp.status().as_u16(), 201) {
-                    t.fail(e);
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 {
+                    t.fail(r.fail_msg(201));
                 } else {
-                    finalizer_pin_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+                    finalizer_pin_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
                 }
             }
@@ -365,32 +383,21 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L5-16", 5, "Unpin blocked by finalizer");
         if finalizer_pin_kappa.is_empty() {
-            t.fail("no finalizer pin κ".into());
+            t.fail("no finalizer pin kappa".into());
         } else {
             let body = format!(r#"{{"pin_kappa":"{finalizer_pin_kappa}"}}"#);
             let rb = client
-                .post(&format!("/v2/{ns}/gc/unpin"))
-                .header("Content-Type", "application/json")
+                .post_with_content_type(&format!("/v2/{ns}/gc/unpin"), "application/json")
                 .body(body);
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    let s = resp.status().as_u16();
-                    if s != 409 {
-                        t.fail(format!("expected 409, got {s}"));
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status != 409 {
+                        t.fail(r.fail_msg(409));
+                    } else if let Err(e) = verify_error_response(&r.body, "FINALIZER_OUTSTANDING") {
+                        t.fail(format!("status 409 but error code wrong: {e}"));
                     } else {
-                        match resp.bytes() {
-                            Ok(body) => {
-                                if let Err(e) =
-                                    verify_error_response(&body, "FINALIZER_OUTSTANDING")
-                                {
-                                    t.fail(format!("status 409 but error code wrong: {e}"));
-                                } else {
-                                    t.pass();
-                                }
-                            }
-                            Err(_) => t.pass(), // Status correct, body unreadable.
-                        }
+                        t.pass();
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -402,17 +409,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L5-17", 5, "Finalizer in GC status");
         match client.send_traced(client.get(&format!("/v2/{ns}/gc/status"))) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                match resp.text() {
-                    Ok(body) => {
-                        if body.contains("test-ctrl") {
-                            t.pass();
-                        } else {
-                            t.fail("test-ctrl not in pending_finalizers".into());
-                        }
-                    }
-                    Err(e) => t.fail(format!("body read failed: {e}")),
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                let body = r.body_text();
+                if body.contains("test-ctrl") {
+                    t.pass();
+                } else {
+                    t.fail(format!("test-ctrl not in pending_finalizers: {body}"));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -423,20 +426,19 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L5-18", 5, "Finalizer release");
         if finalizer_pin_kappa.is_empty() {
-            t.fail("no finalizer pin κ".into());
+            t.fail("no finalizer pin kappa".into());
         } else {
             let body = format!(r#"{{"pin_kappa":"{finalizer_pin_kappa}","release":"true"}}"#);
             let rb = client
-                .post(&format!("/v2/{ns}/gc/unpin"))
-                .header("Content-Type", "application/json")
+                .post_with_content_type(&format!("/v2/{ns}/gc/unpin"), "application/json")
                 .body(body);
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if resp.status().as_u16() == 200 {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 200 {
                         t.pass();
                     } else {
-                        t.fail(format!("expected 200, got {}", resp.status()));
+                        t.fail(r.fail_msg(200));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -448,20 +450,19 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     {
         let mut t = runner.must("L5-19", 5, "Unpin after release");
         if finalizer_pin_kappa.is_empty() {
-            t.fail("no finalizer pin κ".into());
+            t.fail("no finalizer pin kappa".into());
         } else {
             let body = format!(r#"{{"pin_kappa":"{finalizer_pin_kappa}"}}"#);
             let rb = client
-                .post(&format!("/v2/{ns}/gc/unpin"))
-                .header("Content-Type", "application/json")
+                .post_with_content_type(&format!("/v2/{ns}/gc/unpin"), "application/json")
                 .body(body);
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 200 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(200));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -472,17 +473,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     // L5-20 SHOULD "Finalized evicted"
     {
         let mut t = runner.should("L5-20", 5, "Finalized blob evicted after release");
+        let pre_sweep3_id = get_current_sweep_id(client, ns);
         let _ = client.send_traced(client.post(&format!("/v2/{ns}/gc/sweep")));
-        let _ = poll_sweep(client, ns, 60);
+        let _ = poll_sweep(client, ns, 60, pre_sweep3_id.as_deref());
         match client
             .send_traced(client.get(&format!("/v2/{ns}/blobs/{}", data.config.sha256.as_str())))
         {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                if resp.status().as_u16() == 404 {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 404 {
                     t.pass();
                 } else {
-                    t.warn(format!("finalized blob not yet evicted: {}", resp.status()));
+                    t.fail(format!(
+                        "finalized blob not yet evicted: {}: {}",
+                        r.status,
+                        r.body_text()
+                    ));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -498,25 +504,21 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let mut t = runner.must("L5-30", 5, "Filter registration");
         let filter = r#"{"type":"json-match","accept_if":{"contains":"accept"},"reason":"must contain accept"}"#;
         let rb = client
-            .put(&format!("/v2/{ns}/filters/test-filter-scope"))
-            .header("Content-Type", "application/json")
+            .put_with_content_type(
+                &format!("/v2/{ns}/filters/test-filter-scope"),
+                "application/json",
+            )
             .body(filter);
         match client.send_traced(rb) {
-            Ok((resp, trace)) => {
-                t.trace(trace);
-                let s = resp.status().as_u16();
-                if s == 201 {
-                    filter_kappa = resp
-                        .headers()
-                        .get("x-kappa-label")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 {
+                    filter_kappa = r.header("x-kappa-label").unwrap_or("").to_string();
                     t.pass();
-                } else if s == 422 {
-                    t.warn("filter format not supported".into());
+                } else if r.status == 422 {
+                    t.fail(format!("filter format not supported: {}", r.body_text()));
                 } else {
-                    t.fail(format!("expected 201, got {s}"));
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -532,17 +534,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         } else {
             let mut t = runner.must("L5-31", 5, "Filter listing");
             match client.send_traced(client.get(&format!("/v2/{ns}/filters/"))) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    match resp.text() {
-                        Ok(body) => {
-                            if body.contains("test-filter-scope") {
-                                t.pass();
-                            } else {
-                                t.fail("filter not in list".into());
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    let body = r.body_text();
+                    if body.contains("test-filter-scope") {
+                        t.pass();
+                    } else {
+                        t.fail(format!("filter not in list: {body}"));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -562,16 +560,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         } else {
             let mut t = runner.must("L5-32", 5, "Filter-accepted content stored");
             let rb = client
-                .put(&format!("/v2/{ns}/manifests/filter-pass"))
-                .header("Content-Type", "application/json")
+                .put_with_content_type(
+                    &format!("/v2/{ns}/manifests/filter-pass"),
+                    "application/json",
+                )
                 .body(r#"{"data":"this should accept the content"}"#);
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 201) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 201 {
                         t.pass();
+                    } else {
+                        t.fail(format!(
+                            "expected status 201, got {}: {}",
+                            r.status,
+                            r.body_text()
+                        ));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -592,20 +596,19 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         } else {
             let mut t = runner.must("L5-33", 5, "Filter-rejected content rejected");
             let rb = client
-                .put(&format!("/v2/{ns}/manifests/filter-fail"))
-                .header("Content-Type", "application/json")
+                .put_with_content_type(
+                    &format!("/v2/{ns}/manifests/filter-fail"),
+                    "application/json",
+                )
                 .body(r#"{"data":"this will be refused"}"#);
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    let s = resp.status().as_u16();
-                    if s == 422 {
-                        if let Ok(body) = resp.bytes() {
-                            l5_33_body = body.to_vec();
-                        }
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 422 {
+                        l5_33_body = r.body.clone();
                         t.pass();
                     } else {
-                        t.fail(format!("expected 422, got {s}"));
+                        t.fail(format!("expected 422, got {}: {}", r.status, r.body_text()));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -613,7 +616,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
-    // L5-34 MUST "Rejection reason" - validate L5-33's captured body, no re-issue
+    // L5-34 MUST "Rejection reason"
     {
         if !filter_supported {
             runner.skip(
@@ -649,12 +652,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             match client
                 .send_traced(client.get(&format!("/v2/{ns}/blobs/{}", rejected_kappa.as_str())))
             {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 404) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 404 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(404));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -669,12 +672,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         } else {
             let mut t = runner.must("L5-36", 5, "Filter removal");
             match client.send_traced(client.delete(&format!("/v2/{ns}/filters/{filter_kappa}"))) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 202) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 202 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(202));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -694,12 +697,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         } else {
             let mut t = runner.must("L5-37", 5, "Removed filter blob persists");
             match client.send_traced(client.get(&format!("/v2/{ns}/blobs/{filter_kappa}"))) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 200) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 200 {
                         t.pass();
+                    } else {
+                        t.fail(r.fail_msg(200));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -719,16 +722,22 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         } else {
             let mut t = runner.must("L5-38", 5, "Previously rejected content accepted");
             let rb = client
-                .put(&format!("/v2/{ns}/manifests/filter-fail"))
-                .header("Content-Type", "application/json")
+                .put_with_content_type(
+                    &format!("/v2/{ns}/manifests/filter-fail"),
+                    "application/json",
+                )
                 .body(r#"{"data":"this will be refused"}"#);
             match client.send_traced(rb) {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    if let Err(e) = assert_status(resp.status().as_u16(), 201) {
-                        t.fail(e);
-                    } else {
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if r.status == 201 {
                         t.pass();
+                    } else {
+                        t.fail(format!(
+                            "expected status 201, got {}: {}",
+                            r.status,
+                            r.body_text()
+                        ));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -772,10 +781,11 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 .send()
             {
                 Ok(resp) => {
-                    if let Err(e) = assert_status_in(resp.status().as_u16(), &[201, 200]) {
-                        t.fail(e);
-                    } else {
+                    let s = resp.status().as_u16();
+                    if s == 201 || s == 200 {
                         t.pass();
+                    } else {
+                        t.fail(format!("peer push returned {s}"));
                     }
                 }
                 Err(e) => t.fail(format!("peer push failed: {e}")),
@@ -790,13 +800,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             fed_start = Instant::now();
             match client.send_traced(client.get(&format!("/v2/{ns}/blobs/{}", peer_kappa.as_str())))
             {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    fed_status = resp.status().as_u16();
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    fed_status = r.status;
                     if fed_status == 200 || fed_status == 404 {
                         t.pass();
                     } else {
-                        t.fail(format!("unexpected status: {fed_status}"));
+                        t.fail(format!(
+                            "unexpected status: {fed_status}: {}",
+                            r.body_text()
+                        ));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -810,7 +823,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             if fed_status == 200 {
                 t.pass();
             } else {
-                t.warn("federation did not resolve (404)".into());
+                t.fail("federation did not resolve (404)".into());
             }
         }
 
@@ -826,17 +839,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             let mut t = runner.must("L5-53", 5, "Federation content verified");
             match client.send_traced(client.get(&format!("/v2/{ns}/blobs/{}", peer_kappa.as_str())))
             {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
-                    match resp.bytes() {
-                        Ok(body) => {
-                            if let Err(e) = assert_kappa_matches(&body, &peer_kappa) {
-                                t.fail(e);
-                            } else {
-                                t.pass();
-                            }
-                        }
-                        Err(e) => t.fail(format!("body read failed: {e}")),
+                Ok(r) => {
+                    t.trace(r.trace.clone());
+                    if let Err(e) = assert_kappa_matches(&r.body, &peer_kappa) {
+                        t.fail(e);
+                    } else {
+                        t.pass();
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -857,13 +865,13 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             let start = Instant::now();
             match client.send_traced(client.get(&format!("/v2/{ns}/blobs/{}", peer_kappa.as_str())))
             {
-                Ok((resp, trace)) => {
-                    t.trace(trace);
+                Ok(r) => {
+                    t.trace(r.trace.clone());
                     cached_duration = start.elapsed().as_millis() as u64;
-                    if resp.status().as_u16() == 200 {
+                    if r.status == 200 {
                         t.pass();
                     } else {
-                        t.fail(format!("cached fetch returned {}", resp.status()));
+                        t.fail(r.fail_msg(200));
                     }
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
@@ -876,7 +884,7 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             if cached_duration < fed_duration {
                 t.pass();
             } else {
-                t.warn(format!(
+                t.fail(format!(
                     "cached {cached_duration}ms vs first {fed_duration}ms"
                 ));
             }
@@ -926,17 +934,77 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // ── §9.4 Rate Limiting ───────────────────────────────────────────────────
 
-    runner.skip(
-        "L5-60",
-        5,
-        "Rate limit Retry-After present",
-        "no 429 observed",
-    );
-    runner.must("L5-61", 5, "Retry-After format valid").pass();
-    runner.skip(
-        "L5-62",
-        5,
-        "Rate limit behavior recorded",
-        "no rate limiting observed",
-    );
+    // L5-60/61/62: generate load to trigger rate limiting.
+    let mut got_429 = false;
+    let mut retry_after_value: Option<String> = None;
+    let mut rate_limit_trace: Option<crate::client::HttpTrace> = None;
+    {
+        let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
+        let mut statuses: Vec<u16> = Vec::new();
+        for _ in 0..500 {
+            if let Ok(r) = client.send_traced(client.get(&path)) {
+                statuses.push(r.status);
+                if r.status == 429 {
+                    rate_limit_trace = Some(r.trace.clone());
+                    got_429 = true;
+                    retry_after_value = r.header("retry-after").map(|s| s.to_string());
+                    break;
+                }
+            }
+        }
+        let mut counts = std::collections::HashMap::new();
+        for s in &statuses {
+            *counts.entry(*s).or_insert(0usize) += 1;
+        }
+        eprintln!(
+            "  L5-60 burst: {} requests, statuses: {:?}",
+            statuses.len(),
+            counts
+        );
+    }
+
+    {
+        let mut t = runner.should("L5-60", 5, "Rate limit Retry-After present");
+        if let Some(tr) = &rate_limit_trace {
+            t.trace(tr.clone());
+        }
+        if got_429 {
+            if retry_after_value.is_some() {
+                t.pass();
+            } else {
+                t.fail("429 received but no Retry-After header".into());
+            }
+        } else {
+            t.warn("no 429 received after 200 rapid requests".into());
+        }
+    }
+
+    {
+        let t = runner.must("L5-61", 5, "Retry-After format valid");
+        match &retry_after_value {
+            Some(v) => {
+                if v.parse::<u64>().is_ok() || v.contains(',') {
+                    t.pass();
+                } else {
+                    t.fail(format!("Retry-After not a valid integer or HTTP-date: {v}"));
+                }
+            }
+            None => {
+                if got_429 {
+                    t.fail("429 received but no Retry-After to validate".into());
+                } else {
+                    t.pass();
+                }
+            }
+        }
+    }
+
+    {
+        let t = runner.should("L5-62", 5, "Rate limit behavior recorded");
+        if got_429 {
+            t.pass();
+        } else {
+            t.warn("rate limiting not observed under load".into());
+        }
+    }
 }
