@@ -294,12 +294,8 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // L5-12 MUST "Poll sweep"
     {
-        let mut t = runner.must("L5-12", 5, "Sweep completion polling");
+        let t = runner.must("L5-12", 5, "Sweep completion polling");
         if poll_sweep(client, ns, 60, pre_sweep2_id.as_deref()) {
-            if let Ok(sr) = client.send_traced(client.get(&format!("/v2/{ns}/gc/status"))) {
-                t.trace(sr.trace.clone());
-                eprintln!("  L5-12 sweep status: {}", sr.body_text());
-            }
             t.pass();
         } else {
             t.fail("sweep did not complete within 60 seconds".into());
@@ -952,15 +948,6 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 }
             }
         }
-        let mut counts = std::collections::HashMap::new();
-        for s in &statuses {
-            *counts.entry(*s).or_insert(0usize) += 1;
-        }
-        eprintln!(
-            "  L5-60 burst: {} requests, statuses: {:?}",
-            statuses.len(),
-            counts
-        );
     }
 
     {
