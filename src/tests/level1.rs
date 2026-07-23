@@ -89,10 +89,10 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         match client.send_traced(rb) {
             Ok(r) => {
                 t.trace(r.trace.clone());
-                if r.status == 409 {
+                if r.status == 400 {
                     t.pass();
                 } else {
-                    t.fail(r.fail_msg(409));
+                    t.fail(r.fail_msg(400));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -804,10 +804,10 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                     match client.send_traced(rb) {
                         Ok(r2) => {
                             t.trace(r2.trace.clone());
-                            if r2.status == 409 {
+                            if r2.status == 400 {
                                 t.pass();
                             } else {
-                                t.fail(r2.fail_msg(409));
+                                t.fail(r2.fail_msg(400));
                             }
                         }
                         Err(e) => t.fail(format!("close request failed: {e}")),
@@ -1124,10 +1124,10 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         match client.send_traced(rb) {
             Ok(r) => {
                 t.trace(r.trace.clone());
-                if r.status == 409 {
+                if r.status == 400 {
                     t.pass();
                 } else {
-                    t.fail(r.fail_msg(409));
+                    t.fail(r.fail_msg(400));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),

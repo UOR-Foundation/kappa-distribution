@@ -1,4 +1,4 @@
-//! Level 2 - Tag Operations (L2-01 through L2-66).
+//! Level 2 - Tag Operations (L2-01 through L2-73).
 //!
 //! Includes direct tag binding (PUT /tags/) and direct tag resolution (GET /tags/).
 
@@ -1043,6 +1043,169 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
+    // L2-70 MUST "OCI-Subject header on manifest PUT with subject"
+    {
+        let mut t = runner.must(
+            "L2-70",
+            2,
+            "OCI-Subject header returned when subject present",
+        );
+        // Push a subject manifest
+        let subject_content = br#"{"subject-test":"base"}"#;
+        let subject_kappa = KappaLabel::sha256(subject_content);
+        let rb = client
+            .put(&format!("/v2/{ns}/manifests/subject-base"))
+            .body(subject_content.to_vec());
+        match client.send_traced(rb) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 && r.status != 200 {
+                    t.fail(format!("subject push failed: {}", r.fail_msg(201)));
+                } else {
+                    // Push a manifest with a subject field referencing the base
+                    let referrer_content = format!(
+                        r#"{{"subject":{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}","size":{}}},"artifactType":"application/vnd.example.test.v1"}}"#,
+                        subject_kappa.as_str(),
+                        subject_content.len()
+                    );
+                    let rb = client
+                        .put_with_content_type(
+                            &format!("/v2/{ns}/manifests/referrer-test"),
+                            "application/vnd.oci.image.manifest.v1+json",
+                        )
+                        .body(referrer_content.as_bytes().to_vec());
+                    match client.send_traced(rb) {
+                        Ok(r2) => {
+                            t.trace(r2.trace.clone());
+                            if r2.status != 201 {
+                                t.fail(r2.fail_msg(201));
+                            } else {
+                                match r2.header("oci-subject") {
+                                    Some(subj) => {
+                                        if subj == subject_kappa.as_str() {
+                                            t.pass();
+                                        } else {
+                                            t.fail(format!(
+                                                "OCI-Subject wrong: got {subj}, expected {}",
+                                                subject_kappa.as_str()
+                                            ));
+                                        }
+                                    }
+                                    None => t.fail("OCI-Subject header missing".into()),
+                                }
+                            }
+                        }
+                        Err(e) => t.fail(format!("referrer push failed: {e}")),
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L2-71 MUST "Referrers API returns referrer list"
+    {
+        let mut t = runner.must("L2-71", 2, "Referrers API returns OCI Image Index");
+        // The subject and referrer from L2-70 should be available.
+        // The registry needs to have created a refers-to edge from the referrer push.
+        let subject_content = br#"{"subject-test":"base"}"#;
+        let subject_kappa = KappaLabel::sha256(subject_content);
+        let path = format!("/v2/{ns}/referrers/{}", subject_kappa.as_str());
+        match client.send_traced(client.get(&path)) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let ct = r.header("content-type").unwrap_or("");
+                    if !ct.contains("application/vnd.oci.image.index.v1+json") {
+                        t.fail(format!(
+                            "Content-Type wrong: expected OCI image index, got {ct}"
+                        ));
+                    } else {
+                        let body = r.body_text();
+                        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                        let schema = v.get("schemaVersion").and_then(|s| s.as_u64());
+                        let media = v.get("mediaType").and_then(|m| m.as_str());
+                        let manifests = v.get("manifests").and_then(|m| m.as_array());
+                        if schema != Some(2) {
+                            t.fail(format!("schemaVersion wrong: {schema:?}"));
+                        } else if media != Some("application/vnd.oci.image.index.v1+json") {
+                            t.fail(format!("mediaType wrong: {media:?}"));
+                        } else if manifests.is_none() {
+                            t.fail("manifests array missing".into());
+                        } else {
+                            t.pass();
+                        }
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L2-72 MUST "Referrers API with artifactType filter"
+    {
+        let mut t = runner.must("L2-72", 2, "Referrers API filters by artifactType");
+        let subject_content = br#"{"subject-test":"base"}"#;
+        let subject_kappa = KappaLabel::sha256(subject_content);
+        let path = format!(
+            "/v2/{ns}/referrers/{}?artifactType=application/vnd.example.test.v1",
+            subject_kappa.as_str()
+        );
+        match client.send_traced(client.get(&path)) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let filters = r.header("oci-filters-applied").unwrap_or("");
+                    if !filters.contains("artifactType") {
+                        t.fail(format!(
+                            "OCI-Filters-Applied missing or wrong: got {filters}"
+                        ));
+                    } else {
+                        t.pass();
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L2-73 MUST "Referrers API on empty subject returns empty list"
+    {
+        let mut t = runner.must(
+            "L2-73",
+            2,
+            "Referrers API on absent subject returns empty list",
+        );
+        let absent = format!("sha256:{}", "d".repeat(64));
+        let path = format!("/v2/{ns}/referrers/{absent}");
+        match client.send_traced(client.get(&path)) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let body = r.body_text();
+                    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let manifests = v
+                        .get("manifests")
+                        .and_then(|m| m.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    if manifests != 0 {
+                        t.fail(format!("expected empty manifests, got {manifests}"));
+                    } else {
+                        t.pass();
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
     // L2-64 MAY "Teardown tag cleanup"
     if !config.teardown_enabled {
         runner.skip("L2-64", 2, "Teardown tag cleanup", "teardown disabled");
@@ -1058,6 +1221,8 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             "l2-02-tag",
             "l2-09-probe",
             "should-fail",
+            "subject-base",
+            "referrer-test",
         ] {
             let _ = client.send_traced(client.delete(&format!("/v2/{ns}/manifests/{tag}")));
         }
