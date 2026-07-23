@@ -5,6 +5,7 @@ use crate::kappa::KappaLabel;
 pub struct TestBlob {
     pub name: &'static str,
     pub content: &'static [u8],
+    pub sha1: KappaLabel,
     pub sha256: KappaLabel,
     pub blake3: KappaLabel,
 }
@@ -25,9 +26,13 @@ pub struct TestData {
     pub multi_manifest: Vec<u8>,
     pub multi_manifest_sha256: KappaLabel,
     /// Content sent as partial upload data in L1-33 before cancellation. L1-35 computes
-    /// its κ-label and verifies the partial data was NOT stored.
+    /// its kappa-label and verifies the partial data was NOT stored.
     pub cancel_partial_content: &'static [u8],
     pub cancel_partial_sha256: KappaLabel,
+    /// Dedicated blob for L1-71 sha1 chunked upload complete test.
+    pub sha1_upload: TestBlob,
+    /// Dedicated blob for L1-72 sha1 multi-label test.
+    pub sha1_multi: TestBlob,
 }
 
 impl TestData {
@@ -71,6 +76,17 @@ impl TestData {
         );
         let cancel_partial_sha256 = KappaLabel::sha256(cancel_partial_content);
 
+        let sha1_upload_bytes: &'static [u8] = Box::leak(
+            b"sha1-upload-complete-test-content"
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let sha1_upload = make_blob("sha1_upload", sha1_upload_bytes);
+
+        let sha1_multi_bytes: &'static [u8] =
+            Box::leak(b"sha1-multi-label-test-content".to_vec().into_boxed_slice());
+        let sha1_multi = make_blob("sha1_multi", sha1_multi_bytes);
+
         let large_content = b"large-blob-chunk-fill-pattern-1234!".repeat(120_000); // ~4 MiB
         let large_sha256 = KappaLabel::sha256(&large_content);
 
@@ -107,6 +123,8 @@ impl TestData {
             multi_manifest_sha256,
             cancel_partial_content,
             cancel_partial_sha256,
+            sha1_upload,
+            sha1_multi,
         }
     }
 }
@@ -115,6 +133,7 @@ fn make_blob(name: &'static str, content: &'static [u8]) -> TestBlob {
     TestBlob {
         name,
         content,
+        sha1: KappaLabel::sha1(content).expect("sha1 collision in test data"),
         sha256: KappaLabel::sha256(content),
         blake3: KappaLabel::blake3(content),
     }

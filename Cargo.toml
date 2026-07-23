@@ -27,6 +27,9 @@ path = "src/main.rs"
 # Independent SHA-256 (verify-on-receipt for the harness itself)
 sha2 = "0.10"
 
+# Independent SHA-1 with collision detection (RUSTSEC-2025-0021)
+sha1-checked = { version = "0.10", default-features = false }
+
 # Independent BLAKE3 for multi-axis tests
 blake3 = "1"
 

@@ -40,6 +40,7 @@ pub fn assert_body_eq(body: &[u8], expected: &[u8]) -> Result<(), String> {
 
 pub fn assert_kappa_matches(body: &[u8], expected: &KappaLabel) -> Result<(), String> {
     let computed = match expected.axis() {
+        "sha1" => KappaLabel::sha1(body).map_err(|e| format!("sha1 computation failed: {e}"))?,
         "sha256" => KappaLabel::sha256(body),
         "blake3" => KappaLabel::blake3(body),
         _ => {

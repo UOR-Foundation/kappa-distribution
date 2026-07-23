@@ -1181,6 +1181,125 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         }
     }
 
+    // ── §5.10 SHA-1 Axis ───────────────────────────────────────────────────────
+
+    // L1-70 SHOULD "SHA-1 blob push and retrieve"
+    {
+        let mut t = runner.should("L1-70", 1, "SHA-1 blob push and retrieve");
+        let path = format!("/v2/{ns}/blobs/{}", data.hello.sha1.as_str());
+        let rb = client.put(&path).body(data.hello.content.to_vec());
+        match client.send_traced(rb) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 && r.status != 200 {
+                    t.fail(r.fail_msg(201));
+                } else {
+                    match client.send_traced(client.get(&path)) {
+                        Ok(gr) => {
+                            t.trace(gr.trace.clone());
+                            if gr.status != 200 {
+                                t.fail(gr.fail_msg(200));
+                            } else if let Err(e) = assert_body_eq(&gr.body, data.hello.content) {
+                                t.fail(e);
+                            } else {
+                                t.pass();
+                            }
+                        }
+                        Err(e) => t.fail(format!("GET failed: {e}")),
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L1-71 SHOULD "SHA-1 upload complete"
+    {
+        let mut t = runner.should("L1-71", 1, "SHA-1 chunked upload complete");
+        let start_path = format!("/v2/{ns}/blobs/uploads/");
+        match client.send_traced(client.post(&start_path)) {
+            Ok(r) if r.status == 202 => {
+                t.trace(r.trace.clone());
+                let loc = r.header("location").unwrap_or("").to_string();
+                if loc.is_empty() {
+                    t.fail("no Location from upload POST".into());
+                } else {
+                    let content = data.sha1_upload.content;
+                    let patch_rb = client
+                        .patch_url(&loc)
+                        .header("Content-Range", format!("0-{}", content.len() - 1))
+                        .body(content.to_vec());
+                    match client.send_traced(patch_rb) {
+                        Ok(pr) => {
+                            t.trace(pr.trace.clone());
+                            let put_loc = pr.header("location").unwrap_or(&loc).to_string();
+                            let close_url = if put_loc.contains('?') {
+                                format!("{put_loc}&kappa={}", data.sha1_upload.sha1.as_str())
+                            } else {
+                                format!("{put_loc}?kappa={}", data.sha1_upload.sha1.as_str())
+                            };
+                            let rb = client.put_url(&close_url).body(Vec::<u8>::new());
+                            match client.send_traced(rb) {
+                                Ok(r2) => {
+                                    t.trace(r2.trace.clone());
+                                    if r2.status == 201 {
+                                        t.pass();
+                                    } else {
+                                        t.fail(r2.fail_msg(201));
+                                    }
+                                }
+                                Err(e) => t.fail(format!("close request failed: {e}")),
+                            }
+                        }
+                        Err(e) => t.fail(format!("patch failed: {e}")),
+                    }
+                }
+            }
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                t.fail(r.fail_msg(202));
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L1-72 SHOULD "SHA-1 + SHA-256 multi-label push"
+    {
+        let mut t = runner.should("L1-72", 1, "SHA-256 primary with SHA-1 also label");
+        let path = format!(
+            "/v2/{ns}/blobs/{}?also={}",
+            data.sha1_multi.sha256.as_str(),
+            data.sha1_multi.sha1.as_str()
+        );
+        let rb = client.put(&path).body(data.sha1_multi.content.to_vec());
+        match client.send_traced(rb) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 || r.status == 200 {
+                    let sha1_path = format!("/v2/{ns}/blobs/{}", data.sha1_multi.sha1.as_str());
+                    match client.send_traced(client.get(&sha1_path)) {
+                        Ok(gr) => {
+                            t.trace(gr.trace.clone());
+                            if gr.status == 200 {
+                                if let Err(e) = assert_body_eq(&gr.body, data.sha1_multi.content) {
+                                    t.fail(e);
+                                } else {
+                                    t.pass();
+                                }
+                            } else {
+                                t.fail(format!("sha1 address not resolvable: {}", gr.status));
+                            }
+                        }
+                        Err(e) => t.fail(format!("sha1 GET failed: {e}")),
+                    }
+                } else {
+                    t.fail(r.fail_msg(201));
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
     // ── §5.8 Redirect ────────────────────────────────────────────────────────
 
     // L1-60 SHOULD "Redirect followed"
