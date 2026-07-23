@@ -1,4 +1,4 @@
-//! Level 2 - Tag Operations (L2-01 through L2-64).
+//! Level 2 - Tag Operations (L2-01 through L2-66).
 //!
 //! Includes direct tag binding (PUT /tags/) and direct tag resolution (GET /tags/).
 
@@ -44,10 +44,16 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         match client.send_traced(rb) {
             Ok(r) => {
                 t.trace(r.trace.clone());
-                if r.status == 201 {
-                    t.pass();
-                } else {
+                if r.status != 201 {
                     t.fail(r.fail_msg(201));
+                } else if let Err(e) = assert_location_present(&r.headers) {
+                    t.fail(e);
+                } else if let Err(e) =
+                    assert_docker_content_digest(&r.headers, data.simple_manifest_sha256.as_str())
+                {
+                    t.fail(e);
+                } else {
+                    t.pass();
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
@@ -104,6 +110,11 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                         assert_kappa_matches(&r.body, &data.simple_manifest_sha256)
                     {
                         t.fail(format!("re-hash mismatch: {e}"));
+                    } else if let Err(e) = assert_docker_content_digest(
+                        &r.headers,
+                        data.simple_manifest_sha256.as_str(),
+                    ) {
+                        t.fail(e);
                     } else {
                         t.pass();
                     }
@@ -294,12 +305,17 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 } else {
                     let body = r.body_text();
                     let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    // Accept both OCI format (flat string array) and kappa
+                    // format (objects with name field)
                     let names: Vec<&str> = v
                         .get("tags")
                         .and_then(|t| t.as_array())
                         .map(|a| {
                             a.iter()
-                                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                                .filter_map(|t| {
+                                    t.as_str()
+                                        .or_else(|| t.get("name").and_then(|n| n.as_str()))
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -949,6 +965,81 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
             }
+        }
+    }
+
+    // L2-65 MUST "Tag list includes repository name"
+    {
+        let mut t = runner.must("L2-65", 2, "Tag list response includes repository name");
+        match client.send_traced(client.get(&format!("/v2/{ns}/tags/list"))) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let body = r.body_text();
+                    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    match v.get("name").and_then(|n| n.as_str()) {
+                        Some(_) => t.pass(),
+                        None => t.fail(format!("tag list response missing name field: {body}")),
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L2-66 MUST "Manifest delete by digest"
+    {
+        let mut t = runner.must("L2-66", 2, "Manifest delete by digest");
+        // Push a manifest specifically for deletion by digest
+        let del_content = br#"{"delete-by-digest":"test"}"#;
+        let del_kappa = KappaLabel::sha256(del_content);
+        let rb = client
+            .put(&format!("/v2/{ns}/manifests/del-by-digest"))
+            .body(del_content.to_vec());
+        match client.send_traced(rb) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 201 && r.status != 200 {
+                    t.fail(format!("setup push failed: {}", r.fail_msg(201)));
+                } else {
+                    // Delete by digest
+                    match client.send_traced(
+                        client.delete(&format!("/v2/{ns}/manifests/{}", del_kappa.as_str())),
+                    ) {
+                        Ok(r2) => {
+                            t.trace(r2.trace.clone());
+                            if r2.status == 202 {
+                                // Verify the manifest is gone
+                                match client.send_traced(
+                                    client
+                                        .get(&format!("/v2/{ns}/manifests/{}", del_kappa.as_str())),
+                                ) {
+                                    Ok(r3) => {
+                                        t.trace(r3.trace.clone());
+                                        if r3.status == 404 {
+                                            t.pass();
+                                        } else {
+                                            t.fail(format!(
+                                                "manifest still accessible after delete by digest: {}",
+                                                r3.status
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => t.fail(format!("verify GET failed: {e}")),
+                                }
+                            } else if r2.status == 400 || r2.status == 405 {
+                                t.pass();
+                            } else {
+                                t.fail(r2.fail_msg(202));
+                            }
+                        }
+                        Err(e) => t.fail(format!("delete request failed: {e}")),
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 

@@ -46,7 +46,15 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             Ok(r) => {
                 t.trace(r.trace.clone());
                 if r.status == 201 || r.status == 200 {
-                    t.pass();
+                    if r.status == 201 {
+                        if let Err(e) = assert_location_present(&r.headers) {
+                            t.fail(e);
+                        } else {
+                            t.pass();
+                        }
+                    } else {
+                        t.pass();
+                    }
                 } else {
                     t.fail(r.fail_msg(201));
                 }
@@ -108,6 +116,10 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                     t.fail(format!("X-Kappa-Label value wrong: {e}"));
                 } else if let Err(e) = assert_header_value(&r.headers, "x-kappa-axis", "sha256") {
                     t.fail(format!("X-Kappa-Axis value wrong: {e}"));
+                } else if let Err(e) =
+                    assert_docker_content_digest(&r.headers, data.hello.sha256.as_str())
+                {
+                    t.fail(e);
                 } else {
                     t.pass();
                 }
@@ -139,6 +151,10 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                             data.hello.sha256.as_str()
                         ));
                     } else if let Err(e) = assert_body_eq(&r.body, data.hello.content) {
+                        t.fail(e);
+                    } else if let Err(e) =
+                        assert_docker_content_digest(&r.headers, data.hello.sha256.as_str())
+                    {
                         t.fail(e);
                     } else {
                         l1_06_server_kappa = Some(server_label);
@@ -450,10 +466,12 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
     // L1-22 SHOULD "Chunk-Min-Length"
     {
         let t = runner.should("L1-22", 1, "Chunk-Min-Length observed");
-        if let Err(e) = assert_header_present(&l1_20_headers, "x-kappa-chunk-min-length") {
-            t.fail(e);
-        } else {
+        let has_kappa = assert_header_present(&l1_20_headers, "x-kappa-chunk-min-length").is_ok();
+        let has_oci = assert_header_present(&l1_20_headers, "oci-chunk-min-length").is_ok();
+        if has_kappa || has_oci {
             t.pass();
+        } else {
+            t.fail("neither X-Kappa-Chunk-Min-Length nor OCI-Chunk-Min-Length present".into());
         }
     }
 
@@ -701,6 +719,57 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 } else {
                     t.pass();
                 }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L1-55 MUST "Upload complete accepts ?digest= alias"
+    {
+        let mut t = runner.must("L1-55", 1, "Upload complete accepts digest query parameter");
+        let start_path = format!("/v2/{ns}/blobs/uploads/");
+        match client.send_traced(client.post(&start_path)) {
+            Ok(r) if r.status == 202 => {
+                t.trace(r.trace.clone());
+                let loc = r.header("location").unwrap_or("").to_string();
+                if loc.is_empty() {
+                    t.fail("no Location from upload POST".into());
+                } else {
+                    let content = b"digest-alias-test-content";
+                    let kappa = KappaLabel::sha256(content);
+                    let patch_rb = client
+                        .patch_url(&loc)
+                        .header("Content-Range", format!("0-{}", content.len() - 1))
+                        .body(content.to_vec());
+                    match client.send_traced(patch_rb) {
+                        Ok(pr) => {
+                            t.trace(pr.trace.clone());
+                            let put_loc = pr.header("location").unwrap_or(&loc).to_string();
+                            let close_url = if put_loc.contains('?') {
+                                format!("{put_loc}&digest={}", kappa.as_str())
+                            } else {
+                                format!("{put_loc}?digest={}", kappa.as_str())
+                            };
+                            let rb = client.put_url(&close_url).body(Vec::<u8>::new());
+                            match client.send_traced(rb) {
+                                Ok(r2) => {
+                                    t.trace(r2.trace.clone());
+                                    if r2.status == 201 {
+                                        t.pass();
+                                    } else {
+                                        t.fail(r2.fail_msg(201));
+                                    }
+                                }
+                                Err(e) => t.fail(format!("close request failed: {e}")),
+                            }
+                        }
+                        Err(e) => t.fail(format!("patch failed: {e}")),
+                    }
+                }
+            }
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                t.fail(r.fail_msg(202));
             }
             Err(e) => t.fail(format!("request failed: {e}")),
         }
@@ -1059,6 +1128,53 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                     t.pass();
                 } else {
                     t.fail(r.fail_msg(409));
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L1-56 MUST "Single-POST blob push with digest query parameter"
+    {
+        let mut t = runner.must("L1-56", 1, "Single-POST blob push with digest parameter");
+        let content = b"single-post-digest-param-test";
+        let kappa = KappaLabel::sha256(content);
+        let path = format!("/v2/{ns}/blobs/uploads/?digest={}", kappa.as_str());
+        let rb = client
+            .post_with_content_type(&path, "application/octet-stream")
+            .body(content.to_vec());
+        match client.send_traced(rb) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status == 201 {
+                    t.pass();
+                } else if r.status == 202 {
+                    // Registry does not support single-POST, accepted as upload session.
+                    // Fall back: complete via PUT with digest param.
+                    let loc = r.header("location").unwrap_or("").to_string();
+                    if loc.is_empty() {
+                        t.fail("202 but no Location header for fallback".into());
+                    } else {
+                        let close_url = if loc.contains('?') {
+                            format!("{loc}&digest={}", kappa.as_str())
+                        } else {
+                            format!("{loc}?digest={}", kappa.as_str())
+                        };
+                        let rb = client.put_url(&close_url).body(content.to_vec());
+                        match client.send_traced(rb) {
+                            Ok(r2) => {
+                                t.trace(r2.trace.clone());
+                                if r2.status == 201 {
+                                    t.pass();
+                                } else {
+                                    t.fail(r2.fail_msg(201));
+                                }
+                            }
+                            Err(e) => t.fail(format!("PUT fallback failed: {e}")),
+                        }
+                    }
+                } else {
+                    t.fail(r.fail_msg(201));
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),

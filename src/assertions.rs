@@ -61,7 +61,26 @@ pub fn assert_kappa_matches(body: &[u8], expected: &KappaLabel) -> Result<(), St
 }
 
 pub fn assert_kappa_valid(s: &str) -> Result<KappaLabel, String> {
-    KappaLabel::parse(s).map_err(|e| format!("invalid κ-label \"{s}\": {e}"))
+    KappaLabel::parse(s).map_err(|e| format!("invalid kappa-label \"{s}\": {e}"))
+}
+
+/// Verify Docker-Content-Digest header matches expected digest (OCI parity).
+/// The header is REQUIRED on GET/HEAD responses for blobs and manifests per OCI spec.
+pub fn assert_docker_content_digest(
+    headers: &[(String, String)],
+    expected: &str,
+) -> Result<(), String> {
+    assert_header_value(headers, "docker-content-digest", expected)
+}
+
+/// Verify Location header is present and non-empty (OCI parity).
+pub fn assert_location_present(headers: &[(String, String)]) -> Result<(), String> {
+    let lower = "location";
+    match headers.iter().find(|(k, _)| k.to_lowercase() == lower) {
+        Some((_, v)) if !v.is_empty() => Ok(()),
+        Some((_, _)) => Err("Location header present but empty".into()),
+        None => Err("expected Location header present".into()),
+    }
 }
 
 /// Verify the section 6.16 error response format: `{"errors":[{"code":"<EXPECTED>",...}]}`.
