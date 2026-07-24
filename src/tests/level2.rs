@@ -1,4 +1,4 @@
-//! Level 2 - Tag Operations (L2-01 through L2-73).
+//! Level 2 - Tag Operations (L2-01 through L2-80).
 //!
 //! Includes direct tag binding (PUT /tags/) and direct tag resolution (GET /tags/).
 
@@ -1199,6 +1199,31 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                         t.fail(format!("expected empty manifests, got {manifests}"));
                     } else {
                         t.pass();
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L2-80 SHOULD "Manifest PUT sets object-type metadata"
+    {
+        let mut t = runner.should("L2-80", 2, "Manifest sets object-type=manifest metadata");
+        match client.send_traced(client.get_meta_list(
+            &format!("/v2/{ns}"),
+            "object-type",
+            "manifest",
+        )) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let text = r.body_text();
+                    if text.contains("sha256:") {
+                        t.pass();
+                    } else {
+                        t.fail(format!("no manifests in metadata query: {text}"));
                     }
                 }
             }

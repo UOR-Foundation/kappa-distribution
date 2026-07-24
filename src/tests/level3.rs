@@ -1,4 +1,4 @@
-//! Level 3 - Edge Operations (L3-01 through L3-22).
+//! Level 3 - Edge Operations (L3-01 through L3-30).
 //!
 //! Verifies edge canonical form, axis inheritance, direction queries, and deletion semantics.
 
@@ -560,6 +560,28 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
             }
             (Err(e), _) => t.fail(format!("source HEAD failed: {e}")),
             (_, Err(e)) => t.fail(format!("target HEAD failed: {e}")),
+        }
+    }
+
+    // L3-30 SHOULD "Edge PUT sets object-type metadata"
+    {
+        let mut t = runner.should("L3-30", 3, "Edge sets object-type=edge metadata");
+        match client.send_traced(client.get_meta_list(&format!("/v2/{ns}"), "object-type", "edge"))
+        {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let text = r.body_text();
+                    if text.contains("sha256:") {
+                        t.pass();
+                    } else {
+                        t.fail(format!("no edges in metadata query: {text}"));
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 }

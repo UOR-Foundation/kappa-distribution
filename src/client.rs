@@ -253,6 +253,16 @@ impl RegistryClient {
             .headers(self.headers_no_body())
     }
 
+    /// Query blobs by metadata: GET /v2/{path}/blobs/_meta?key={key}&value={value}
+    pub fn get_meta_list(&self, path: &str, key: &str, value: &str) -> RequestBuilder {
+        self.inner
+            .get(format!(
+                "{}{path}/blobs/_meta?key={key}&value={value}",
+                self.base_url
+            ))
+            .headers(self.headers_no_body())
+    }
+
     /// Send a request, fully consume the response, and return a TracedResponse
     /// with status, headers, body, and trace metadata all available as fields.
     ///

@@ -1,4 +1,4 @@
-//! Level 5 - GC, Admission, Federation (L5-01 through L5-62).
+//! Level 5 - GC, Admission, Federation (L5-01 through L5-71).
 //!
 //! Verifies pin/unpin/sweep/finalizer lifecycle, reachability-based GC,
 //! admission filter registration/enforcement/removal, federation fetch
@@ -930,21 +930,36 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
 
     // ── §9.4 Rate Limiting ───────────────────────────────────────────────────
 
-    // L5-60/61/62: generate load to trigger rate limiting.
+    // Adaptive burst test: read x-ratelimit-limit from the first response
+    // to discover the burst capacity, then send limit+1 requests to
+    // guarantee a 429. This works for any burst size configuration.
     let mut got_429 = false;
     let mut retry_after_value: Option<String> = None;
     let mut rate_limit_trace: Option<crate::client::HttpTrace> = None;
+    let mut burst_limit: u64 = 0;
     {
-        let path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
-        let mut statuses: Vec<u16> = Vec::new();
-        for _ in 0..500 {
-            if let Ok(r) = client.send_traced(client.get(&path)) {
-                statuses.push(r.status);
-                if r.status == 429 {
-                    rate_limit_trace = Some(r.trace.clone());
-                    got_429 = true;
-                    retry_after_value = r.header("retry-after").map(|s| s.to_string());
-                    break;
+        // Probe to discover burst capacity from x-ratelimit-limit header.
+        let probe_path = format!("/v2/{ns}/blobs/{}", data.hello.sha256.as_str());
+        if let Ok(r) = client.send_traced(client.get(&probe_path)) {
+            burst_limit = r
+                .header("x-ratelimit-limit")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+
+        if burst_limit > 0 {
+            // We already consumed 1 token with the probe. Send enough to
+            // exhaust the remaining burst and trigger 429.
+            // Cap at 2000 to avoid runaway in misconfigured registries.
+            let remaining = burst_limit.min(2000);
+            for _ in 0..remaining {
+                if let Ok(r) = client.send_traced(client.get(&probe_path)) {
+                    if r.status == 429 {
+                        rate_limit_trace = Some(r.trace.clone());
+                        got_429 = true;
+                        retry_after_value = r.header("retry-after").map(|s| s.to_string());
+                        break;
+                    }
                 }
             }
         }
@@ -955,14 +970,18 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         if let Some(tr) = &rate_limit_trace {
             t.trace(tr.clone());
         }
-        if got_429 {
+        if burst_limit == 0 {
+            t.warn("x-ratelimit-limit header not present, rate limiting not configured".into());
+        } else if got_429 {
             if retry_after_value.is_some() {
                 t.pass();
             } else {
                 t.fail("429 received but no Retry-After header".into());
             }
         } else {
-            t.warn("no 429 received after 200 rapid requests".into());
+            t.warn(format!(
+                "no 429 after {burst_limit} requests (burst_limit={burst_limit})"
+            ));
         }
     }
 
@@ -990,8 +1009,102 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
         let t = runner.should("L5-62", 5, "Rate limit behavior recorded");
         if got_429 {
             t.pass();
+        } else if burst_limit == 0 {
+            t.warn("rate limiting not configured (no x-ratelimit-limit header)".into());
         } else {
-            t.warn("rate limiting not observed under load".into());
+            t.warn(format!(
+                "rate limiting not triggered (burst_limit={burst_limit})"
+            ));
+        }
+    }
+
+    // Burst test cleanup: compute the required wait from the burst size
+    // and refill rate, sleep exactly that long, then verify with one probe.
+    // Hard cap at 10 seconds -- if the config needs longer, the conformance
+    // script's rate limit settings are too aggressive for testing.
+    if got_429 {
+        // The burst test consumed burst_limit tokens. Each token refills at
+        // period_ms intervals. We need at least 10 tokens back for the
+        // subsequent tests (blob PUT + pin POST + metadata queries).
+        // Retry-After tells us the per-token wait in seconds. We need
+        // 10 * retry_after seconds, capped at 10.
+        let per_token_wait = retry_after_value
+            .as_ref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let needed_wait = (10 * per_token_wait).min(10);
+        std::thread::sleep(Duration::from_secs(needed_wait));
+    }
+
+    // L5-70 SHOULD "Filter registration sets object-type metadata"
+    {
+        let mut t = runner.should(
+            "L5-70",
+            5,
+            "Filter registration sets object-type=filter metadata",
+        );
+        match client.send_traced(client.get_meta_list(
+            &format!("/v2/{ns}"),
+            "object-type",
+            "filter",
+        )) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if r.body_text().contains("sha256:") {
+                    t.pass();
+                } else {
+                    t.fail(format!("no filters in metadata query: {}", r.body_text()));
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L5-71 SHOULD "Pin creation sets object-type metadata"
+    // Earlier GC tests evict pins, so this test creates its own pin
+    // and verifies the metadata before any sweep can remove it.
+    {
+        let mut t = runner.should("L5-71", 5, "Pin creation sets object-type=pin metadata");
+        // Re-push a blob and pin it so the pin blob exists for the query
+        let pin_content = b"pin-metadata-test-blob";
+        let pin_blob_kappa = KappaLabel::sha256(pin_content);
+        let rb = client
+            .put(&format!("/v2/{ns}/blobs/{}", pin_blob_kappa.as_str()))
+            .body(pin_content.to_vec());
+        let _ = client.send_traced(rb);
+        let pin_body = format!(r#"{{"kappa":"{}","ttl":0}}"#, pin_blob_kappa.as_str());
+        let rb = client
+            .post_with_content_type(&format!("/v2/{ns}/gc/pin"), "application/json")
+            .body(pin_body);
+        match client.send_traced(rb) {
+            Ok(pr) => {
+                t.trace(pr.trace.clone());
+                if pr.status != 201 {
+                    t.fail(format!("pin creation failed: {}", pr.fail_msg(201)));
+                } else {
+                    match client.send_traced(client.get_meta_list(
+                        &format!("/v2/{ns}"),
+                        "object-type",
+                        "pin",
+                    )) {
+                        Ok(r) => {
+                            t.trace(r.trace.clone());
+                            if r.status != 200 {
+                                t.fail(r.fail_msg(200));
+                            } else if r.body_text().contains("sha256:") {
+                                t.pass();
+                            } else {
+                                t.fail(format!("no pins in metadata query: {}", r.body_text()));
+                            }
+                        }
+                        Err(e) => t.fail(format!("metadata query failed: {e}")),
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 }

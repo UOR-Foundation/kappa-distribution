@@ -1,4 +1,4 @@
-//! Level 4 - Composition, Witnesses, Schemas (L4-01 through L4-48).
+//! Level 4 - Composition, Witnesses, Schemas (L4-01 through L4-52).
 //!
 //! Verifies G2/F4/E6/E7/E8 composition operations, witness self-describing headers,
 //! composed-of/witness-of edge provenance, cross-axis rejection, schema registration
@@ -757,6 +757,83 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 }
                 Err(e) => t.fail(format!("request failed: {e}")),
             }
+        }
+    }
+
+    // L4-50 SHOULD "Composition sets object-type metadata"
+    {
+        let mut t = runner.should(
+            "L4-50",
+            4,
+            "Composition sets object-type=composition metadata",
+        );
+        match client.send_traced(client.get_meta_list(
+            &format!("/v2/{ns}"),
+            "object-type",
+            "composition",
+        )) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if r.body_text().contains("sha256:") {
+                    t.pass();
+                } else {
+                    t.fail(format!(
+                        "no compositions in metadata query: {}",
+                        r.body_text()
+                    ));
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L4-51 SHOULD "Witness sets object-type metadata"
+    {
+        let mut t = runner.should("L4-51", 4, "Witness sets object-type=witness metadata");
+        match client.send_traced(client.get_meta_list(
+            &format!("/v2/{ns}"),
+            "object-type",
+            "witness",
+        )) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if r.body_text().contains("sha256:") {
+                    t.pass();
+                } else {
+                    t.fail(format!("no witnesses in metadata query: {}", r.body_text()));
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L4-52 SHOULD "Schema registration sets object-type metadata"
+    {
+        let mut t = runner.should(
+            "L4-52",
+            4,
+            "Schema registration sets object-type=schema metadata",
+        );
+        match client.send_traced(client.get_meta_list(
+            &format!("/v2/{ns}"),
+            "object-type",
+            "schema",
+        )) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else if r.body_text().contains("sha256:") {
+                    t.pass();
+                } else {
+                    t.fail(format!("no schemas in metadata query: {}", r.body_text()));
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
         }
     }
 }
