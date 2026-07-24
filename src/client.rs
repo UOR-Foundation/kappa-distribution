@@ -253,6 +253,20 @@ impl RegistryClient {
             .headers(self.headers_no_body())
     }
 
+    /// Create a bundle: POST /v2/{path}/_bundle/create with JSON body.
+    pub fn bundle_create(&self, path: &str) -> RequestBuilder {
+        self.inner
+            .post(format!("{}{path}/_bundle/create", self.base_url))
+            .headers(self.headers_with_body("application/json"))
+    }
+
+    /// Ingest a bundle: POST /v2/{path}/_bundle/ingest with bundle bytes.
+    pub fn bundle_ingest(&self, path: &str) -> RequestBuilder {
+        self.inner
+            .post(format!("{}{path}/_bundle/ingest", self.base_url))
+            .headers(self.headers_with_body("application/x-kappa-bundle"))
+    }
+
     /// Query blobs by metadata: GET /v2/{path}/blobs/_meta?key={key}&value={value}
     pub fn get_meta_list(&self, path: &str, key: &str, value: &str) -> RequestBuilder {
         self.inner

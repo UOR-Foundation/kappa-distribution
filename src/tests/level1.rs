@@ -1,4 +1,4 @@
-//! Level 1 - Blob Operations (L1-01 through L1-91).
+//! Level 1 - Blob Operations (L1-01 through L1-91, L1-80 through L1-82).
 //!
 //! State carried across Level 1:
 //!   upload_url: String - from L1-20
@@ -1297,6 +1297,145 @@ pub fn run(runner: &mut TestRunner, client: &RegistryClient, config: &Config, da
                 }
             }
             Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // ── §5.11 Bundle Bulk Transfer ──────────────────────────────────────────
+
+    // L1-80 SHOULD "Bundle create returns KBND format"
+    {
+        let mut t = runner.should("L1-80", 1, "Bundle create returns KBND format");
+        let create_body = format!(
+            r#"{{"kappas":["{}","{}"],"delta":false}}"#,
+            data.hello.sha256.as_str(),
+            data.config.sha256.as_str()
+        );
+        let rb = client.bundle_create(&format!("/v2/{ns}")).body(create_body);
+        match client.send_traced(rb) {
+            Ok(r) => {
+                t.trace(r.trace.clone());
+                if r.status != 200 {
+                    t.fail(r.fail_msg(200));
+                } else {
+                    let ct = r.header("content-type").unwrap_or("");
+                    if !ct.contains("kappa-bundle") {
+                        t.fail(format!(
+                            "expected content-type application/x-kappa-bundle, got: {ct}"
+                        ));
+                    } else if r.body.len() < 10 {
+                        t.fail(format!("bundle too short: {} bytes", r.body.len()));
+                    } else if &r.body[..4] != b"KBND" {
+                        t.fail(format!("missing KBND magic: got {:?}", &r.body[..4]));
+                    } else {
+                        t.pass();
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L1-81 SHOULD "Bundle create and ingest round-trip"
+    {
+        let mut t = runner.should("L1-81", 1, "Bundle create and ingest round-trip");
+        let create_body = format!(
+            r#"{{"kappas":["{}","{}"],"delta":false}}"#,
+            data.hello.sha256.as_str(),
+            data.config.sha256.as_str()
+        );
+        let rb = client.bundle_create(&format!("/v2/{ns}")).body(create_body);
+        match client.send_traced(rb) {
+            Ok(cr) => {
+                t.trace(cr.trace.clone());
+                if cr.status != 200 {
+                    t.fail(cr.fail_msg(200));
+                } else {
+                    // Ingest the bundle into a different namespace
+                    let ingest_ns = format!("{ns}-bundle-ingest");
+                    let rb = client
+                        .bundle_ingest(&format!("/v2/{ingest_ns}"))
+                        .body(cr.body.clone());
+                    match client.send_traced(rb) {
+                        Ok(ir) => {
+                            t.trace(ir.trace.clone());
+                            if ir.status != 200 {
+                                t.fail(ir.fail_msg(200));
+                            } else {
+                                let v: serde_json::Value =
+                                    serde_json::from_slice(&ir.body).unwrap_or_default();
+                                let ingested = v["ingested"].as_array();
+                                if ingested.is_none_or(|a| a.len() < 2) {
+                                    t.fail(format!("expected 2 ingested, got: {}", ir.body_text()));
+                                } else {
+                                    // Verify the blobs are retrievable
+                                    let path = format!(
+                                        "/v2/{ingest_ns}/blobs/{}",
+                                        data.hello.sha256.as_str()
+                                    );
+                                    match client.send_traced(client.get(&path)) {
+                                        Ok(gr) => {
+                                            t.trace(gr.trace.clone());
+                                            if gr.status == 200 {
+                                                if let Err(e) =
+                                                    assert_body_eq(&gr.body, data.hello.content)
+                                                {
+                                                    t.fail(e);
+                                                } else {
+                                                    t.pass();
+                                                }
+                                            } else {
+                                                t.fail(format!(
+                                                    "ingested blob not retrievable: {}",
+                                                    gr.status
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => t.fail(format!("GET failed: {e}")),
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => t.fail(format!("ingest failed: {e}")),
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("request failed: {e}")),
+        }
+    }
+
+    // L1-82 SHOULD "Bundle ingest rejects corrupted bundle"
+    {
+        let mut t = runner.should("L1-82", 1, "Bundle ingest rejects corrupted bundle");
+        let create_body = format!(
+            r#"{{"kappas":["{}"],"delta":false}}"#,
+            data.hello.sha256.as_str()
+        );
+        let rb = client.bundle_create(&format!("/v2/{ns}")).body(create_body);
+        match client.send_traced(rb) {
+            Ok(cr) => {
+                t.trace(cr.trace.clone());
+                if cr.status != 200 {
+                    t.fail(cr.fail_msg(200));
+                } else {
+                    let mut corrupted = cr.body.clone();
+                    if let Some(last) = corrupted.last_mut() {
+                        *last ^= 0xFF;
+                    }
+                    let rb = client.bundle_ingest(&format!("/v2/{ns}")).body(corrupted);
+                    match client.send_traced(rb) {
+                        Ok(ir) => {
+                            t.trace(ir.trace.clone());
+                            if ir.status == 409 || ir.status == 400 {
+                                t.pass();
+                            } else {
+                                t.fail(format!("corrupted bundle accepted: status {}", ir.status));
+                            }
+                        }
+                        Err(e) => t.fail(format!("ingest request failed: {e}")),
+                    }
+                }
+            }
+            Err(e) => t.fail(format!("create request failed: {e}")),
         }
     }
 
