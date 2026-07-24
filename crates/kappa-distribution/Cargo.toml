@@ -1,0 +1,17 @@
+[package]
+name = "kappa-distribution"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "κ-Distribution protocol standard: canonical byte forms, error taxonomy, and conformance levels. The cross-registry contract that any conforming /v2/ registry implements."
+
+# Zero dependencies. This crate defines byte contracts — it never hashes,
+# never does I/O, never allocates beyond what the caller provides. Registry
+# implementors depend on this; the conformance binary does NOT (independent
+# hash computation is the point).
+
+[dependencies]
+
+[features]
+default = ["std"]
+std = []

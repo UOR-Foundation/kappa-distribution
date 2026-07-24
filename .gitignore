@@ -1,0 +1,8 @@
+/target/
+/.direnv/
+/.env
+/kappa-conformance-report/
+*.swp
+*.swo
+*~
+tmp
